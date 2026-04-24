@@ -1,0 +1,18 @@
+{
+  "name": "@workspace/openclaw-teamspeak",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw TeamSpeak channel and voice bridge plugin",
+  "type": "module",
+  "scripts": {
+    "check": "npm run check:syntax",
+    "check:syntax": "node --check index.js && node --check hook-relay.js",
+    "check:plugin": "node --check index.js",
+    "check:relay": "node --check hook-relay.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}
