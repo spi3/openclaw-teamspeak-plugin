@@ -11,9 +11,9 @@ npm run check
 Useful runtime checks:
 
 ```bash
-/home/openclaw/.local/bin/ts status
-/home/openclaw/.local/bin/ts daemon status --json
-/home/openclaw/.local/bin/ts events hook list --json
+ts status
+ts daemon status --json
+ts events hook list --json
 openclaw gateway call teamspeak.voice.status --json
 ```
 

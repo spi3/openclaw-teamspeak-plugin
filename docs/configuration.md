@@ -9,19 +9,26 @@ Config lives under `channels.teamspeak`.
   "channels": {
     "teamspeak": {
       "enabled": true,
-      "cliPath": "/home/openclaw/.local/bin/ts",
-      "profile": "wormhole-alpha",
-      "server": "172.16.2.10:9987",
-      "nickname": "Calder",
+      "cliPath": "ts",
+      "profile": "my-teamspeak-profile",
+      "server": "ts.example.net:9987",
+      "nickname": "OpenClaw",
       "identity": "...optional...",
       "configPath": "...optional...",
-      "defaultTo": "teamspeak:channel:1",
+      "defaultTo": "teamspeak:channel:lobby",
       "ingressPath": "/plugins/teamspeak/inbound",
       "daemonPollMs": 1000
     }
   }
 }
 ```
+
+If `cliPath` is omitted, the plugin falls back to the first non-empty environment override it finds:
+- `OPENCLAW_TEAMSPEAK_CLI_PATH`
+- `TEAMSPEAK_CLI_PATH`
+- `TS_CLI_PATH`
+
+If none are set, it uses `ts` from `PATH`.
 
 ## Session defaults
 
@@ -82,14 +89,14 @@ The plugin uses the normal OpenClaw media-audio path. Example:
           {
             "provider": "openai",
             "model": "whisper-1",
-            "baseUrl": "http://10.10.10.129:8000/v1"
+            "baseUrl": "http://stt.example.internal:8000/v1"
           }
         ],
         "request": {
           "allowPrivateNetwork": true,
           "auth": {
             "mode": "authorization-bearer",
-            "token": "x"
+            "token": "replace-me"
           }
         }
       }

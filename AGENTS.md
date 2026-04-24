@@ -14,9 +14,9 @@ There is no build step; OpenClaw loads `./index.js` directly.
   Syntax-checks `index.js` only.
 - `npm run check:relay`
   Syntax-checks `hook-relay.js` only.
-- `/home/openclaw/.local/bin/ts daemon status --json`
+- `ts daemon status --json`
   Confirms the TeamSpeak daemon is up.
-- `/home/openclaw/.local/bin/ts events hook list --json`
+- `ts events hook list --json`
   Confirms required hook registrations exist.
 - `openclaw gateway call teamspeak.voice.status --json`
   Reads voice/media diagnostics from the live plugin.

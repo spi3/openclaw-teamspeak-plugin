@@ -28,8 +28,8 @@ Then, when the change affects runtime behavior, verify the smallest relevant liv
 ### Text
 
 ```bash
-/home/openclaw/.local/bin/ts daemon status --json
-/home/openclaw/.local/bin/ts events hook list --json
+ts daemon status --json
+ts events hook list --json
 ```
 
 Send a real TeamSpeak DM or channel message and confirm the mapped OpenClaw session and outbound reply behavior.

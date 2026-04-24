@@ -18,9 +18,10 @@ import { readJsonWebhookBodyOrReject } from "openclaw/plugin-sdk/webhook-ingress
 
 const CHANNEL_ID = "teamspeak";
 const DEFAULT_ACCOUNT_ID = "default";
-const DEFAULT_TS_CLI_PATH = "/home/openclaw/.local/bin/ts";
+const DEFAULT_TS_CLI_COMMAND = "ts";
 const DEFAULT_DAEMON_POLL_MS = 1000;
 const DEFAULT_INGRESS_PATH = "/plugins/teamspeak/inbound";
+const TEAMSPEAK_CLI_ENV_VARS = ["OPENCLAW_TEAMSPEAK_CLI_PATH", "TEAMSPEAK_CLI_PATH", "TS_CLI_PATH"];
 const ROUTE_CACHE_LIMIT = 256;
 const DEDUPE_TTL_MS = 60 * 1000;
 const DAEMON_RESTART_DELAY_MS = 2000;
@@ -197,13 +198,51 @@ function normalizeIngressPath(value) {
   return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
 }
 
+function resolveTeamspeakCliPath(channelConfig) {
+  const configured = normalizeOptionalString(channelConfig?.cliPath);
+  if (configured) {
+    return configured;
+  }
+  for (const envName of TEAMSPEAK_CLI_ENV_VARS) {
+    const envValue = normalizeOptionalString(process.env[envName]);
+    if (envValue) {
+      return envValue;
+    }
+  }
+  return DEFAULT_TS_CLI_COMMAND;
+}
+
+function executableExists(command) {
+  const normalized = normalizeOptionalString(command);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.includes(path.sep) || path.isAbsolute(normalized)) {
+    return fs.existsSync(normalized);
+  }
+  const pathValue = normalizeOptionalString(process.env.PATH);
+  if (!pathValue) {
+    return false;
+  }
+  for (const entry of pathValue.split(path.delimiter)) {
+    const base = normalizeOptionalString(entry);
+    if (!base) {
+      continue;
+    }
+    if (fs.existsSync(path.join(base, normalized))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function resolveTeamspeakChannelConfig(cfg) {
   const channelConfig = isRecord(cfg?.channels?.[CHANNEL_ID]) ? cfg.channels[CHANNEL_ID] : {};
-  const cliPath = normalizeOptionalString(channelConfig.cliPath) || DEFAULT_TS_CLI_PATH;
+  const cliPath = resolveTeamspeakCliPath(channelConfig);
   return {
     accountId: DEFAULT_ACCOUNT_ID,
     enabled: normalizeBoolean(channelConfig.enabled, true),
-    configured: fs.existsSync(cliPath),
+    configured: executableExists(cliPath),
     cliPath,
     profile: normalizeOptionalString(channelConfig.profile),
     server: normalizeOptionalString(channelConfig.server),
@@ -2857,7 +2896,7 @@ export default defineChannelPluginEntry({
           });
           return;
         }
-        const text = normalizeOptionalString(params?.text) || "This is Calder testing TeamSpeak voice playback.";
+        const text = normalizeOptionalString(params?.text) || "This is a TeamSpeak voice playback test.";
         const generation = sharedState.voice.playbackGeneration;
         try {
           await readSelfIdentity(api.config);

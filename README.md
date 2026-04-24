@@ -63,7 +63,7 @@ Configure `channels.teamspeak` in `~/.openclaw/openclaw.json`:
   "channels": {
     "teamspeak": {
       "enabled": true,
-      "cliPath": "/home/openclaw/.local/bin/ts",
+      "cliPath": "ts",
       "daemonPollMs": 1000,
       "ingressPath": "/plugins/teamspeak/inbound",
       "sessionDefaults": {
@@ -85,6 +85,13 @@ Configure `channels.teamspeak` in `~/.openclaw/openclaw.json`:
 }
 ```
 
+If `cliPath` is omitted, the plugin now falls back to the first configured environment override it finds:
+- `OPENCLAW_TEAMSPEAK_CLI_PATH`
+- `TEAMSPEAK_CLI_PATH`
+- `TS_CLI_PATH`
+
+If none are set, it uses `ts` from `PATH`.
+
 For STT/TTS and config details, see:
 - `docs/configuration.md`
 - `docs/event-surfaces.md`
@@ -100,9 +107,9 @@ npm run check
 Useful live checks:
 
 ```bash
-/home/openclaw/.local/bin/ts status
-/home/openclaw/.local/bin/ts daemon status --json
-/home/openclaw/.local/bin/ts events hook list --json
+ts status
+ts daemon status --json
+ts events hook list --json
 openclaw gateway call teamspeak.voice.status --json
 ```
 
