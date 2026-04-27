@@ -76,6 +76,7 @@ Configure `channels.teamspeak` in `~/.openclaw/openclaw.json`:
         "mode": "wake_word",
         "silenceTimeoutMs": 1200,
         "interruptOnSpeech": true,
+        "interruptMode": "wake_word",
         "stripWakeWord": true,
         "mirrorTextReplies": false,
         "transcriptionLanguage": "en"
@@ -91,6 +92,10 @@ If `cliPath` is omitted, the plugin now falls back to the first configured envir
 - `TS_CLI_PATH`
 
 If none are set, it uses `ts` from `PATH`.
+
+`interruptMode` supports:
+- `"any_speech"` — current behavior, interrupt playback as soon as another speaker starts
+- `"wake_word"` — only interrupt after a finalized/transcribed utterance is accepted via wake word
 
 For STT/TTS and config details, see:
 - `docs/configuration.md`

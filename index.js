@@ -26,6 +26,9 @@ const ROUTE_CACHE_LIMIT = 256;
 const DEDUPE_TTL_MS = 60 * 1000;
 const DAEMON_RESTART_DELAY_MS = 2000;
 const VOICE_RECONNECT_DELAY_MS = 2000;
+const VOICE_RECONNECT_MAX_DELAY_MS = 60 * 1000;
+const VOICE_RECONNECT_LOG_INTERVAL_MS = 30 * 1000;
+const VOICE_START_DELAY_MS = 5000;
 const VOICE_DEFAULT_SILENCE_TIMEOUT_MS = 1200;
 const VOICE_WAKE_CACHE_TTL_MS = 30 * 1000;
 const PLAYBACK_SAMPLE_RATE = 48000;
@@ -40,6 +43,8 @@ const PLAYBACK_QUEUE_WAIT_SLICE_MS = 10;
 const VOICE_REPLY_FIRST_CHUNK_MIN_CHARS = 24;
 const VOICE_REPLY_CHUNK_MIN_CHARS = 48;
 const VOICE_REPLY_CHUNK_SOFT_MAX_CHARS = 160;
+const TEAMSPEAK_CHANNEL_SESSION_ID = "all";
+const TEAMSPEAK_CHANNEL_CONVERSATION_LABEL = "TeamSpeak channel";
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_RELAY_PATH = path.join(MODULE_DIR, "hook-relay.js");
 
@@ -49,13 +54,6 @@ const runtimeStore = createPluginRuntimeStore({
 });
 
 const SELF_IDENTITY_TTL_MS = 15 * 1000;
-const FAST_GATEWAY_CALL_SCOPES = {
-  "sessions.patch": ["operator.admin"],
-  "voicewake.get": ["operator.read"],
-  "talk.speak": ["operator.write"]
-};
-
-let cachedGatewayCaller = null;
 
 const sharedState = {
   daemonChild: null,
@@ -78,8 +76,14 @@ const sharedState = {
   },
   voice: {
     socket: null,
+    startTimer: null,
     reconnectTimer: null,
     reconnectDelayMs: VOICE_RECONNECT_DELAY_MS,
+    reconnectAttempt: 0,
+    lastReconnectDelayMs: 0,
+    lastConnectionFailureKey: "",
+    lastConnectionFailureLogAt: 0,
+    suppressedConnectionFailures: 0,
     buffer: Buffer.alloc(0),
     startupError: "",
     connected: false,
@@ -158,6 +162,14 @@ function normalizeTeamspeakVoiceMode(value) {
   return "wake_word";
 }
 
+function normalizeTeamspeakInterruptMode(value) {
+  const normalized = normalizeOptionalString(value).toLowerCase();
+  if (normalized === "wake_word" || normalized === "any_speech") {
+    return normalized;
+  }
+  return "any_speech";
+}
+
 function normalizeTeamspeakVoiceConfig(value) {
   const voiceConfig = isRecord(value) ? value : {};
   return {
@@ -168,6 +180,7 @@ function normalizeTeamspeakVoiceConfig(value) {
       VOICE_DEFAULT_SILENCE_TIMEOUT_MS
     ),
     interruptOnSpeech: normalizeBoolean(voiceConfig.interruptOnSpeech, true),
+    interruptMode: normalizeTeamspeakInterruptMode(voiceConfig.interruptMode),
     stripWakeWord: normalizeBoolean(voiceConfig.stripWakeWord, true),
     allowedHandlers: normalizeStringArray(voiceConfig.allowedHandlers),
     allowedChannels: normalizeStringArray(voiceConfig.allowedChannels),
@@ -396,31 +409,8 @@ async function callGatewayJsonViaCli(method, params) {
   return stdout ? JSON.parse(stdout) : null;
 }
 
-async function loadFastGatewayCaller() {
-  if (cachedGatewayCaller) {
-    return cachedGatewayCaller;
-  }
-  const sdk = await import("openclaw/plugin-sdk/testing");
-  if (typeof sdk?.callGateway !== "function") {
-    throw new Error("openclaw/plugin-sdk/testing did not export callGateway");
-  }
-  cachedGatewayCaller = sdk.callGateway;
-  return cachedGatewayCaller;
-}
-
 async function callGatewayJson(method, params) {
-  try {
-    const callGateway = await loadFastGatewayCaller();
-    const scopes = FAST_GATEWAY_CALL_SCOPES[method];
-    return await callGateway({
-      method,
-      params,
-      timeoutMs: 30000,
-      ...(Array.isArray(scopes) ? { scopes } : {})
-    });
-  } catch {
-    return await callGatewayJsonViaCli(method, params);
-  }
+  return await callGatewayJsonViaCli(method, params);
 }
 
 function hexEncode(value) {
@@ -514,6 +504,69 @@ function clearVoiceReconnectTimer() {
     clearTimeout(sharedState.voice.reconnectTimer);
     sharedState.voice.reconnectTimer = null;
   }
+}
+
+function clearVoiceStartTimer() {
+  if (sharedState.voice.startTimer) {
+    clearTimeout(sharedState.voice.startTimer);
+    sharedState.voice.startTimer = null;
+  }
+}
+
+function getVoiceReconnectDelayMs() {
+  const baseDelayMs = Math.max(1, sharedState.voice.reconnectDelayMs || VOICE_RECONNECT_DELAY_MS);
+  const attempt = Math.max(0, sharedState.voice.reconnectAttempt);
+  const multiplier = 2 ** Math.min(attempt, 6);
+  return Math.min(VOICE_RECONNECT_MAX_DELAY_MS, baseDelayMs * multiplier);
+}
+
+function formatVoiceReconnectDelay(delayMs) {
+  return delayMs >= 1000 ? `${Math.round(delayMs / 1000)}s` : `${delayMs}ms`;
+}
+
+function resetVoiceReconnectBackoff() {
+  sharedState.voice.reconnectAttempt = 0;
+  sharedState.voice.lastReconnectDelayMs = 0;
+  sharedState.voice.lastConnectionFailureKey = "";
+  sharedState.voice.lastConnectionFailureLogAt = 0;
+  sharedState.voice.suppressedConnectionFailures = 0;
+}
+
+function logVoiceConnectionFailure(logger, message, delayMs) {
+  const failureKey = normalizeOptionalString(message) || "media socket connection failed";
+  const now = Date.now();
+  const sameFailure = sharedState.voice.lastConnectionFailureKey === failureKey;
+  const recentFailure =
+    sameFailure && now - sharedState.voice.lastConnectionFailureLogAt < VOICE_RECONNECT_LOG_INTERVAL_MS;
+  if (recentFailure) {
+    sharedState.voice.suppressedConnectionFailures += 1;
+    return;
+  }
+  const suppressed = sameFailure ? sharedState.voice.suppressedConnectionFailures : 0;
+  sharedState.voice.lastConnectionFailureKey = failureKey;
+  sharedState.voice.lastConnectionFailureLogAt = now;
+  sharedState.voice.suppressedConnectionFailures = 0;
+  const suppressedText = suppressed > 0 ? ` (${suppressed} repeated failures suppressed)` : "";
+  const retryText = delayMs > 0 ? `; retrying in ${formatVoiceReconnectDelay(delayMs)}` : "";
+  logger.warn?.(`[teamspeak voice] ${failureKey}${suppressedText}${retryText}`);
+}
+
+function scheduleTeamspeakVoiceManagerStart(cfg, stateDir, logger) {
+  clearVoiceStartTimer();
+  sharedState.voice.startTimer = setTimeout(() => {
+    sharedState.voice.startTimer = null;
+    if (sharedState.stopping || !resolveTeamspeakChannelConfig(cfg).voice.enabled) {
+      return;
+    }
+    startTeamspeakVoiceManager(cfg, stateDir, logger).catch((error) => {
+      const failureMessage = `delayed voice manager start failed: ${String(error)}`;
+      sharedState.voice.startupError = failureMessage;
+      logger.warn?.(`[teamspeak voice] ${failureMessage}`);
+      scheduleVoiceReconnect(cfg, logger, failureMessage);
+    });
+  }, VOICE_START_DELAY_MS);
+  sharedState.voice.startTimer.unref?.();
+  logger.info?.(`[teamspeak voice] scheduled voice manager start in ${formatVoiceReconnectDelay(VOICE_START_DELAY_MS)}`);
 }
 
 function clearSpeakerFinalizeTimer(speakerState) {
@@ -1999,10 +2052,42 @@ async function dispatchTeamspeakTurn({ cfg, normalized, logger, deliverReply, ex
       ignored: "self-message"
     };
   }
+  if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
+    let resolvedChannelId = await resolveLiveSpeakerChannelId(
+      cfg,
+      {
+        channelId: normalized.target?.id,
+        clientId: normalized.sender?.id,
+        uid: normalized.sender?.uid,
+        nickname: normalized.sender?.name
+      },
+      logger
+    );
+    if (!isUsableTeamspeakChannelId(resolvedChannelId)) {
+      resolvedChannelId = await resolveLiveSpeakerChannelId(
+        cfg,
+        {
+          clientId: selfIdentity.clientId,
+          uid: selfIdentity.uid,
+          nickname: selfIdentity.nickname
+        },
+        logger
+      );
+    }
+    if (isUsableTeamspeakChannelId(resolvedChannelId)) {
+      logger.info?.(
+        `[teamspeak] corrected channel message target: ${normalized.target?.id || "<empty>"} -> ${resolvedChannelId}`
+      );
+      normalized.target.id = resolvedChannelId;
+    }
+  }
+  if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
+    throw new Error(`channel message has unresolved TeamSpeak channel id ${normalized.target?.id || "<empty>"}`);
+  }
   const sessionPeerId =
     normalized.messageKind === "client"
       ? normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)
-      : normalizeOptionalString(normalized.target.id);
+      : TEAMSPEAK_CHANNEL_SESSION_ID;
   const route = runtime.channel.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
@@ -2030,7 +2115,7 @@ async function dispatchTeamspeakTurn({ cfg, normalized, logger, deliverReply, ex
       ? normalizeOptionalString(normalized.sender.name) ||
         normalizeOptionalString(normalized.sender.uid) ||
         normalizeOptionalString(normalized.sender.id)
-      : `channel:${normalized.target.id}`;
+      : TEAMSPEAK_CHANNEL_CONVERSATION_LABEL;
   const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
   const body = runtime.channel.reply.formatAgentEnvelope({
     channel: "TeamSpeak",
@@ -2046,6 +2131,7 @@ async function dispatchTeamspeakTurn({ cfg, normalized, logger, deliverReply, ex
       : `teamspeak:channel:${normalized.target.id}`;
   const untrustedContext = [
     ...(normalized.handler ? [`TeamSpeak handler: ${normalized.handler}`] : []),
+    ...(normalized.messageKind === "channel" ? [`TeamSpeak current channel id: ${normalized.target.id}`] : []),
     ...(Array.isArray(extraUntrustedContext) ? extraUntrustedContext.filter(Boolean) : [])
   ];
   const groupSystemPrompt = buildTeamspeakVoiceReplySystemPrompt(normalized);
@@ -2084,7 +2170,7 @@ async function dispatchTeamspeakTurn({ cfg, normalized, logger, deliverReply, ex
     NativeDirectUserId:
       normalized.messageKind === "client" ? normalizeOptionalString(normalized.sender.uid) || undefined : undefined,
     GroupSubject:
-      normalized.messageKind === "channel" ? `channel:${normalizeOptionalString(normalized.target.id)}` : undefined,
+      normalized.messageKind === "channel" ? TEAMSPEAK_CHANNEL_CONVERSATION_LABEL : undefined,
     Provider: CHANNEL_ID,
     Surface: CHANNEL_ID,
     MessageSid: normalized.fingerprint,
@@ -2370,6 +2456,23 @@ async function finalizeSpeakerUtterance(cfg, speakerKey, logger, reason) {
       wakeMatched: accepted.wakeMatched === true,
       wakeTrigger: accepted.trigger || undefined
     };
+    const selfSpeaker = matchesSelfIdentity(
+      {
+        uid: speakerState.uid,
+        clientId: speakerState.clientId,
+        nickname: speakerState.nickname
+      },
+      sharedState.selfIdentity
+    );
+    if (
+      voiceConfig.interruptOnSpeech &&
+      voiceConfig.interruptMode === "wake_word" &&
+      sharedState.voice.playbackActive &&
+      accepted.wakeMatched === true &&
+      !selfSpeaker
+    ) {
+      await clearTeamspeakPlayback(logger, `wake-word:${speakerKey}`);
+    }
     const normalized = buildVoiceNormalizedEvent(speakerState, accepted.text);
     await dispatchTeamspeakTurn({
       cfg,
@@ -2387,16 +2490,23 @@ async function finalizeSpeakerUtterance(cfg, speakerKey, logger, reason) {
   }
 }
 
-function scheduleVoiceReconnect(cfg, logger) {
+function scheduleVoiceReconnect(cfg, logger, failureMessage = "") {
   if (sharedState.stopping || !resolveTeamspeakChannelConfig(cfg).voice.enabled) {
     return;
   }
   clearVoiceReconnectTimer();
+  const delayMs = getVoiceReconnectDelayMs();
+  sharedState.voice.lastReconnectDelayMs = delayMs;
+  if (failureMessage) {
+    logVoiceConnectionFailure(logger, failureMessage, delayMs);
+  }
   sharedState.voice.reconnectTimer = setTimeout(() => {
     connectTeamspeakVoiceManager(cfg, logger).catch((error) => {
       logger.error?.(`[teamspeak voice] reconnect failed: ${String(error)}`);
     });
-  }, sharedState.voice.reconnectDelayMs);
+  }, delayMs);
+  sharedState.voice.reconnectTimer.unref?.();
+  sharedState.voice.reconnectAttempt += 1;
 }
 
 function handleVoiceMediaFrame(cfg, frame, logger) {
@@ -2458,7 +2568,13 @@ function handleVoiceMediaFrame(cfg, frame, logger) {
       },
       sharedState.selfIdentity
     );
-    if (resolveTeamspeakChannelConfig(cfg).voice.interruptOnSpeech && voiceState.playbackActive && !selfSpeaker) {
+    const voiceConfig = resolveTeamspeakChannelConfig(cfg).voice;
+    if (
+      voiceConfig.interruptOnSpeech &&
+      voiceConfig.interruptMode === "any_speech" &&
+      voiceState.playbackActive &&
+      !selfSpeaker
+    ) {
       clearTeamspeakPlayback(logger, `speaker-start:${speakerKey}`).catch(() => {});
     }
     const speakerState = {
@@ -2516,19 +2632,23 @@ async function connectTeamspeakVoiceManager(cfg, logger) {
       throw new Error("could not resolve TeamSpeak media socket path");
     }
     const socket = net.createConnection(sharedState.voice.mediaSocketPath);
+    let socketConnected = false;
+    let socketErrorMessage = "";
     sharedState.voice.socket = socket;
     sharedState.voice.buffer = Buffer.alloc(0);
     socket.on("connect", () => {
+      socketConnected = true;
+      resetVoiceReconnectBackoff();
       sharedState.voice.connected = true;
       sharedState.voice.connecting = false;
       sharedState.voice.startupError = "";
+      sharedState.voice.lastError = "";
       logger.info?.(`[teamspeak voice] connected to media socket ${sharedState.voice.mediaSocketPath}`);
       try {
         requestMediaStatus(socket);
       } catch (error) {
         logger.warn?.(`[teamspeak voice] failed to request media status after connect: ${String(error)}`);
       }
-      refreshVoiceWakeTriggers(logger, true).catch(() => {});
     });
     socket.on("data", (chunk) => {
       sharedState.voice.buffer = Buffer.concat([sharedState.voice.buffer, chunk]);
@@ -2553,34 +2673,53 @@ async function connectTeamspeakVoiceManager(cfg, logger) {
       }
     });
     socket.on("error", (error) => {
+      socketErrorMessage = String(error);
+      if (sharedState.voice.socket !== socket) {
+        return;
+      }
       sharedState.voice.connecting = false;
-      sharedState.voice.lastError = String(error);
-      logger.warn?.(`[teamspeak voice] media socket error: ${String(error)}`);
+      sharedState.voice.lastError = socketErrorMessage;
     });
     socket.on("close", () => {
+      if (sharedState.voice.socket !== socket) {
+        return;
+      }
+      const wasConnected = socketConnected || sharedState.voice.connected;
       sharedState.voice.connected = false;
       sharedState.voice.connecting = false;
       sharedState.voice.socket = null;
       sharedState.voice.buffer = Buffer.alloc(0);
-      logger.warn?.("[teamspeak voice] media socket disconnected");
-      scheduleVoiceReconnect(cfg, logger);
+      if (wasConnected) {
+        logger.warn?.("[teamspeak voice] media socket disconnected");
+        scheduleVoiceReconnect(cfg, logger);
+        return;
+      }
+      const failureMessage = socketErrorMessage
+        ? `media socket unavailable: ${socketErrorMessage}`
+        : "media socket closed before connect";
+      sharedState.voice.startupError = failureMessage;
+      scheduleVoiceReconnect(cfg, logger, failureMessage);
     });
   } catch (error) {
-    sharedState.voice.startupError = String(error);
+    const failureMessage = `failed to connect media manager: ${String(error)}`;
+    sharedState.voice.startupError = failureMessage;
     sharedState.voice.connected = false;
     sharedState.voice.connecting = false;
-    logger.warn?.(`[teamspeak voice] failed to connect media manager: ${String(error)}`);
-    scheduleVoiceReconnect(cfg, logger);
+    sharedState.voice.socket = null;
+    scheduleVoiceReconnect(cfg, logger, failureMessage);
   }
 }
 
 async function startTeamspeakVoiceManager(cfg, stateDir, logger) {
+  clearVoiceStartTimer();
   sharedState.voice.stateDir = ensureVoiceStateDir(stateDir);
   await connectTeamspeakVoiceManager(cfg, logger);
 }
 
 async function stopTeamspeakVoiceManager(logger) {
+  clearVoiceStartTimer();
   clearVoiceReconnectTimer();
+  resetVoiceReconnectBackoff();
   for (const speakerState of sharedState.voice.speakers.values()) {
     clearSpeakerFinalizeTimer(speakerState);
   }
@@ -2843,6 +2982,12 @@ export default defineChannelPluginEntry({
           sessionDefaults: resolveTeamspeakChannelConfig(api.config).sessionDefaults,
           connected: sharedState.voice.connected,
           connecting: sharedState.voice.connecting,
+          voiceStartPending: Boolean(sharedState.voice.startTimer),
+          reconnectAttempt: sharedState.voice.reconnectAttempt || undefined,
+          nextReconnectDelayMs: sharedState.voice.reconnectTimer
+            ? sharedState.voice.lastReconnectDelayMs || undefined
+            : undefined,
+          suppressedConnectionFailures: sharedState.voice.suppressedConnectionFailures || undefined,
           mediaSocketPath: sharedState.voice.mediaSocketPath,
           mediaFormat: sharedState.voice.mediaFormat,
           mediaTransport: sharedState.voice.mediaTransport,
@@ -3006,7 +3151,7 @@ export default defineChannelPluginEntry({
           startOwnedDaemon(ctx.config, ctx.logger);
         }
         if (resolveTeamspeakChannelConfig(ctx.config).voice.enabled) {
-          await startTeamspeakVoiceManager(ctx.config, sharedState.routeStateDir, ctx.logger);
+          scheduleTeamspeakVoiceManagerStart(ctx.config, sharedState.routeStateDir, ctx.logger);
         } else {
           await stopTeamspeakVoiceManager(ctx.logger);
         }

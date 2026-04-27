@@ -61,6 +61,7 @@ The plugin applies these to the mapped OpenClaw session before the turn runs.
         "mode": "wake_word",
         "silenceTimeoutMs": 1200,
         "interruptOnSpeech": true,
+        "interruptMode": "wake_word",
         "stripWakeWord": true,
         "allowedHandlers": [],
         "allowedChannels": [],
@@ -73,6 +74,12 @@ The plugin applies these to the mapped OpenClaw session before the turn runs.
   }
 }
 ```
+
+`interruptMode` is only used when `interruptOnSpeech` is `true`:
+- `"any_speech"` interrupts playback on any other detected speaker start
+- `"wake_word"` interrupts only when a finalized utterance is accepted by the wake-word path
+
+Because the current TeamSpeak voice path is finalize-then-transcribe, `"wake_word"` interruption happens after the new utterance is finalized and transcribed, not on the first syllable.
 
 ## STT integration
 

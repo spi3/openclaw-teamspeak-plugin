@@ -76,6 +76,13 @@
           "interruptOnSpeech": {
             "type": "boolean"
           },
+          "interruptMode": {
+            "type": "string",
+            "enum": [
+              "any_speech",
+              "wake_word"
+            ]
+          },
           "stripWakeWord": {
             "type": "boolean"
           },
@@ -105,6 +112,126 @@
           },
           "transcriptionLanguage": {
             "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "channelConfigs": {
+    "teamspeak": {
+      "label": "TeamSpeak",
+      "description": "Local TeamSpeak bridge powered by ts daemon hooks and the TeamSpeak client plugin.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "cliPath": {
+            "type": "string"
+          },
+          "profile": {
+            "type": "string"
+          },
+          "server": {
+            "type": "string"
+          },
+          "nickname": {
+            "type": "string"
+          },
+          "identity": {
+            "type": "string"
+          },
+          "configPath": {
+            "type": "string"
+          },
+          "defaultTo": {
+            "type": "string"
+          },
+          "ingressPath": {
+            "type": "string"
+          },
+          "daemonPollMs": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sessionDefaults": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "fastMode": {
+                "type": "boolean"
+              },
+              "thinkingLevel": {
+                "type": "string"
+              }
+            }
+          },
+          "voice": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "always_on",
+                  "wake_word",
+                  "push_to_talk",
+                  "wake_or_ptt"
+                ]
+              },
+              "silenceTimeoutMs": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "interruptOnSpeech": {
+                "type": "boolean"
+              },
+              "interruptMode": {
+                "type": "string",
+                "enum": [
+                  "any_speech",
+                  "wake_word"
+                ]
+              },
+              "stripWakeWord": {
+                "type": "boolean"
+              },
+              "allowedHandlers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "allowedChannels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "allowedUsers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "mediaSocketPath": {
+                "type": "string"
+              },
+              "mirrorTextReplies": {
+                "type": "boolean"
+              },
+              "transcriptionLanguage": {
+                "type": "string"
+              }
+            }
           }
         }
       }
