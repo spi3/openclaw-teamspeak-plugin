@@ -2,10 +2,16 @@
 
 ## Local checks
 
-Syntax only:
+Syntax plus unit tests:
 
 ```bash
 npm run check
+```
+
+Unit tests only:
+
+```bash
+npm test
 ```
 
 Useful runtime checks:
@@ -30,10 +36,15 @@ openclaw gateway call teamspeak.voice.status --json
 
 ## Current testing reality
 
-There is no standalone automated integration harness for this plugin yet.
+The project has standalone unit tests under `tests/` for the stable pure seams:
+- config normalization and schema validation
+- text hook event normalization and dedupe
+- route-cache persistence and conversation target derivation
+- outbound TeamSpeak argv construction
+- voice acceptance, reply cleanup, media helpers, and diagnostics
+- `hook-relay.js` argument parsing and local HTTP forwarding
 
-Confidence comes from:
-- syntax validation
+There is still no standalone automated integration harness for a live OpenClaw gateway plus TeamSpeak client. Runtime confidence still needs:
 - direct gateway diagnostics
 - real TeamSpeak text round-trips
 - real TeamSpeak voice round-trips
@@ -42,6 +53,5 @@ Confidence comes from:
 
 When this project grows further, the next sane steps are:
 - split `index.js` into `src/` modules
-- add fixture-based tests for event normalization and routing
 - add a repeatable local integration script
 - move from manual changelog maintenance to tagged releases if it gets a real remote

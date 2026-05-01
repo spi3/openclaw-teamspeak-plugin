@@ -9,11 +9,13 @@ This plugin is now a small but proper project. `index.js` is still the OpenClaw 
 There is no build step; OpenClaw loads `./index.js` directly.
 
 - `npm run check`
-  Runs syntax validation for the main plugin and relay helper.
+  Runs syntax validation plus the unit test suite.
 - `npm run check:plugin`
   Syntax-checks `index.js` only.
 - `npm run check:relay`
   Syntax-checks `hook-relay.js` only.
+- `npm test`
+  Runs the unit test suite under `tests/`.
 - `ts daemon status --json`
   Confirms the TeamSpeak daemon is up.
 - `ts events hook list --json`
@@ -35,14 +37,14 @@ Use ESM JavaScript only; `package.json` is set to `"type": "module"`. Match the 
 
 ## Testing Guidelines
 
-This project currently relies on syntax checks plus live integration verification. Validate the smallest meaningful path for the change:
+This project has unit tests for stable pure seams plus live integration verification for runtime behavior. Validate the smallest meaningful path for the change:
 - text hook ingestion
 - session routing
 - transcription acceptance
 - playback behavior
 - diagnostics exposure
 
-If automated tests are added later, place them under `tests/` and focus first on event normalization, conversation key derivation, and outbound command construction.
+Place automated tests under `tests/` and keep covering event normalization, conversation key derivation, outbound command construction, voice policy, media helpers, and diagnostics exposure.
 
 ## Commit & Pull Request Guidelines
 

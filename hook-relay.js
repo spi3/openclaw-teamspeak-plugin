@@ -2,6 +2,8 @@
 
 import http from "node:http";
 import https from "node:https";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 function parseArgs(argv) {
   const result = {
@@ -107,8 +109,21 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+function isMainModule() {
+  return Boolean(process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]));
+}
+
+export const __testInternals = {
+  parseArgs,
+  pickEnv,
+  postJson,
+  isMainModule
+};
+
+if (isMainModule()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -21,7 +21,7 @@ This is live code and currently used in a real OpenClaw runtime.
 
 Current shape:
 - production code is still intentionally small and flat
-- integration is real, but testing is mostly syntax + live/manual verification
+- unit tests cover the stable plugin seams; live/manual verification still covers TeamSpeak/OpenClaw integration
 - broader non-message TeamSpeak event integration is deferred until `teamspeak-cli` event docs are clearer
 
 ## Repository layout
@@ -103,10 +103,16 @@ For STT/TTS and config details, see:
 
 ## Checks
 
-Syntax:
+Syntax plus unit tests:
 
 ```bash
 npm run check
+```
+
+Unit tests only:
+
+```bash
+npm test
 ```
 
 Useful live checks:
@@ -139,7 +145,7 @@ Voice path:
 - TeamSpeak text hooks currently reconcile only `message.received`
 - broader `ts events watch` event hookup exists in principle but is not wired into OpenClaw yet
 - the media bridge is still the authoritative path for live voice activity
-- automated tests are still thin; most confidence comes from live integration checks
+- live TeamSpeak/OpenClaw behavior still needs targeted integration checks after runtime changes
 
 ## Related docs
 

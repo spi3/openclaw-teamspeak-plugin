@@ -55,26 +55,8 @@ const runtimeStore = createPluginRuntimeStore({
 
 const SELF_IDENTITY_TTL_MS = 15 * 1000;
 
-const sharedState = {
-  daemonChild: null,
-  daemonOwned: false,
-  daemonRestartTimer: null,
-  ingressSecret: "",
-  routeStateDir: "",
-  serviceConfig: null,
-  stopping: false,
-  routeCache: {
-    dmByUid: new Map(),
-    channelById: new Map()
-  },
-  dedupeSeenAt: new Map(),
-  selfIdentity: {
-    refreshedAt: 0,
-    uid: "",
-    clientId: "",
-    nickname: ""
-  },
-  voice: {
+function createInitialVoiceState() {
+  return {
     socket: null,
     startTimer: null,
     reconnectTimer: null,
@@ -109,8 +91,58 @@ const sharedState = {
     lastTranscriptionMetrics: null,
     lastPromptGuidance: null,
     stateDir: ""
+  };
+}
+
+function createInitialSharedState() {
+  return {
+    daemonChild: null,
+    daemonOwned: false,
+    daemonRestartTimer: null,
+    ingressSecret: "",
+    routeStateDir: "",
+    serviceConfig: null,
+    stopping: false,
+    routeCache: {
+      dmByUid: new Map(),
+      channelById: new Map()
+    },
+    dedupeSeenAt: new Map(),
+    selfIdentity: {
+      refreshedAt: 0,
+      uid: "",
+      clientId: "",
+      nickname: ""
+    },
+    voice: createInitialVoiceState()
+  };
+}
+
+const sharedState = createInitialSharedState();
+
+function resetSharedStateForTests() {
+  if (sharedState.daemonRestartTimer) {
+    clearTimeout(sharedState.daemonRestartTimer);
   }
-};
+  if (sharedState.voice.startTimer) {
+    clearTimeout(sharedState.voice.startTimer);
+  }
+  if (sharedState.voice.reconnectTimer) {
+    clearTimeout(sharedState.voice.reconnectTimer);
+  }
+  for (const speakerState of sharedState.voice.speakers.values()) {
+    if (speakerState?.finalizeTimer) {
+      clearTimeout(speakerState.finalizeTimer);
+    }
+  }
+  if (sharedState.voice.socket && !sharedState.voice.socket.destroyed) {
+    sharedState.voice.socket.destroy();
+  }
+  for (const key of Object.keys(sharedState)) {
+    delete sharedState[key];
+  }
+  Object.assign(sharedState, createInitialSharedState());
+}
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -879,6 +911,39 @@ function queuedPlaybackBufferMs() {
   return Math.max(0, Math.round((sharedState.voice.queuedPlaybackSamples * 1000) / PLAYBACK_SAMPLE_RATE));
 }
 
+function buildTeamspeakVoiceStatus(cfg) {
+  return {
+    enabled: resolveTeamspeakChannelConfig(cfg).voice.enabled,
+    sessionDefaults: resolveTeamspeakChannelConfig(cfg).sessionDefaults,
+    connected: sharedState.voice.connected,
+    connecting: sharedState.voice.connecting,
+    voiceStartPending: Boolean(sharedState.voice.startTimer),
+    reconnectAttempt: sharedState.voice.reconnectAttempt || undefined,
+    nextReconnectDelayMs: sharedState.voice.reconnectTimer
+      ? sharedState.voice.lastReconnectDelayMs || undefined
+      : undefined,
+    suppressedConnectionFailures: sharedState.voice.suppressedConnectionFailures || undefined,
+    mediaSocketPath: sharedState.voice.mediaSocketPath,
+    mediaFormat: sharedState.voice.mediaFormat,
+    mediaTransport: sharedState.voice.mediaTransport,
+    playbackActive: sharedState.voice.playbackActive,
+    queuedPlaybackSamples: sharedState.voice.queuedPlaybackSamples,
+    queuedPlaybackBufferMs: queuedPlaybackBufferMs(),
+    activeSpeakerCount: sharedState.voice.activeSpeakerCount,
+    droppedIngressChunks: sharedState.voice.droppedIngressChunks,
+    droppedPlaybackChunks: sharedState.voice.droppedPlaybackChunks,
+    wakeTriggers: sharedState.voice.wakeTriggers,
+    wakeFetchedAt: sharedState.voice.wakeFetchedAt || undefined,
+    lastHelloAt: sharedState.voice.lastHelloAt || undefined,
+    lastStatusAt: sharedState.voice.lastStatusAt || undefined,
+    lastError: sharedState.voice.lastError || undefined,
+    lastPlaybackMetrics: sharedState.voice.lastPlaybackMetrics || undefined,
+    lastTranscriptionMetrics: sharedState.voice.lastTranscriptionMetrics || undefined,
+    lastPromptGuidance: sharedState.voice.lastPromptGuidance || undefined,
+    startupError: sharedState.voice.startupError || undefined
+  };
+}
+
 function resolveConfiguredAudioTranscriptionTarget(cfg) {
   const audioConfig = isRecord(cfg?.tools?.media?.audio) ? cfg.tools.media.audio : {};
   const modelEntry = Array.isArray(audioConfig.models) ? audioConfig.models.find((entry) => isRecord(entry)) : null;
@@ -1485,30 +1550,39 @@ function resolveTeamspeakOutboundTarget(raw) {
   };
 }
 
-async function sendTeamspeakText(account, targetRef, text) {
+function buildTeamspeakTextSendArgs(targetRef, text) {
   const trimmedText = String(text ?? "").trim();
   if (!trimmedText) {
     throw new Error("refusing to send an empty TeamSpeak message");
   }
   const target = resolveTeamspeakOutboundTarget(targetRef);
-  await runTsText(account, [
-    "message",
-    "send",
-    "--target",
-    target.cliTarget,
-    "--id",
-    target.id,
-    "--text",
-    trimmedText
-  ]);
+  return {
+    target,
+    trimmedText,
+    args: [
+      "message",
+      "send",
+      "--target",
+      target.cliTarget,
+      "--id",
+      target.id,
+      "--text",
+      trimmedText
+    ]
+  };
+}
+
+async function sendTeamspeakText(account, targetRef, text) {
+  const command = buildTeamspeakTextSendArgs(targetRef, text);
+  await runTsText(account, command.args);
   return {
     channel: CHANNEL_ID,
     messageId: `teamspeak-${Date.now()}`,
-    chatId: target.id,
-    conversationId: target.targetKey,
+    chatId: command.target.id,
+    conversationId: command.target.targetKey,
     meta: {
-      teamspeakTarget: target.cliTarget,
-      ...(target.uid ? { teamspeakUid: target.uid } : {})
+      teamspeakTarget: command.target.cliTarget,
+      ...(command.target.uid ? { teamspeakUid: command.target.uid } : {})
     }
   };
 }
@@ -2965,6 +3039,81 @@ const teamspeakPlugin = createChatChannelPlugin({
   }
 });
 
+export const __testInternals = {
+  constants: {
+    CHANNEL_ID,
+    DEFAULT_ACCOUNT_ID,
+    DEFAULT_DAEMON_POLL_MS,
+    DEFAULT_INGRESS_PATH,
+    PLAYBACK_SAMPLE_RATE,
+    PLAYBACK_CHANNELS,
+    PLAYBACK_FORMAT,
+    TEAMSPEAK_CHANNEL_SESSION_ID,
+    TEAMSPEAK_CHANNEL_CONVERSATION_LABEL
+  },
+  sharedState,
+  resetSharedStateForTests,
+  normalizeOptionalString,
+  normalizePositiveInteger,
+  normalizeStringArray,
+  normalizeTeamspeakVoiceMode,
+  normalizeTeamspeakInterruptMode,
+  normalizeTeamspeakVoiceConfig,
+  normalizeTeamspeakSessionDefaults,
+  normalizeIngressPath,
+  resolveTeamspeakCliPath,
+  resolveTeamspeakChannelConfig,
+  buildSessionDefaultsPatchParams,
+  buildTsGlobalArgs,
+  hexEncode,
+  hexDecode,
+  deriveMediaSocketPathFromControlPath,
+  getVoiceReconnectDelayMs,
+  parseMediaFrameFields,
+  parseWavPcmToFloat32,
+  mixToMono,
+  resampleFloat32Mono,
+  float32ToPcm16Buffer,
+  convertWavToTeamspeakPlayback,
+  buildWavBufferFromPcm,
+  buildMediaHeader,
+  findWakeWordMatch,
+  evaluateVoiceAcceptance,
+  pcmBufferDurationMs,
+  queuedPlaybackBufferMs,
+  buildTeamspeakVoiceStatus,
+  resolveConfiguredAudioTranscriptionTarget,
+  shellQuote,
+  resolveGatewayBaseUrl,
+  routeCacheFilePath,
+  loadRouteCache,
+  updateDmRouteCache,
+  updateChannelRouteCache,
+  claimInboundFingerprint,
+  parseTimestamp,
+  normalizeMessageKind,
+  normalizeInboundPayload,
+  safeEqualText,
+  parseTeamspeakTarget,
+  resolveTeamspeakOutboundTarget,
+  buildTeamspeakTextSendArgs,
+  extractReplyText,
+  normalizeTeamspeakVoiceReplyText,
+  joinTeamspeakVoiceReplyText,
+  findTeamspeakVoiceReplyBoundary,
+  hookUrlForConfig,
+  buildHookExecCommand,
+  normalizeHookRecord,
+  matchesSelfIdentity,
+  isUsableTeamspeakChannelId,
+  isSelfInboundMessage,
+  buildTeamspeakVoiceReplySystemPrompt,
+  buildVoiceNormalizedEvent,
+  handleVoiceMediaFrame,
+  validateTeamspeakConfig,
+  teamspeakConfigSchema
+};
+
 export default defineChannelPluginEntry({
   id: CHANNEL_ID,
   name: "TeamSpeak",
@@ -2977,36 +3126,7 @@ export default defineChannelPluginEntry({
     api.registerGatewayMethod(
       "teamspeak.voice.status",
       ({ respond }) => {
-        respond(true, {
-          enabled: resolveTeamspeakChannelConfig(api.config).voice.enabled,
-          sessionDefaults: resolveTeamspeakChannelConfig(api.config).sessionDefaults,
-          connected: sharedState.voice.connected,
-          connecting: sharedState.voice.connecting,
-          voiceStartPending: Boolean(sharedState.voice.startTimer),
-          reconnectAttempt: sharedState.voice.reconnectAttempt || undefined,
-          nextReconnectDelayMs: sharedState.voice.reconnectTimer
-            ? sharedState.voice.lastReconnectDelayMs || undefined
-            : undefined,
-          suppressedConnectionFailures: sharedState.voice.suppressedConnectionFailures || undefined,
-          mediaSocketPath: sharedState.voice.mediaSocketPath,
-          mediaFormat: sharedState.voice.mediaFormat,
-          mediaTransport: sharedState.voice.mediaTransport,
-          playbackActive: sharedState.voice.playbackActive,
-          queuedPlaybackSamples: sharedState.voice.queuedPlaybackSamples,
-          queuedPlaybackBufferMs: queuedPlaybackBufferMs(),
-          activeSpeakerCount: sharedState.voice.activeSpeakerCount,
-          droppedIngressChunks: sharedState.voice.droppedIngressChunks,
-          droppedPlaybackChunks: sharedState.voice.droppedPlaybackChunks,
-          wakeTriggers: sharedState.voice.wakeTriggers,
-          wakeFetchedAt: sharedState.voice.wakeFetchedAt || undefined,
-          lastHelloAt: sharedState.voice.lastHelloAt || undefined,
-          lastStatusAt: sharedState.voice.lastStatusAt || undefined,
-          lastError: sharedState.voice.lastError || undefined,
-          lastPlaybackMetrics: sharedState.voice.lastPlaybackMetrics || undefined,
-          lastTranscriptionMetrics: sharedState.voice.lastTranscriptionMetrics || undefined,
-          lastPromptGuidance: sharedState.voice.lastPromptGuidance || undefined,
-          startupError: sharedState.voice.startupError || undefined
-        });
+        respond(true, buildTeamspeakVoiceStatus(api.config));
       },
       { scope: "operator.read" }
     );

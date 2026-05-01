@@ -5,10 +5,12 @@
   "description": "OpenClaw TeamSpeak channel and voice bridge plugin",
   "type": "module",
   "scripts": {
-    "check": "npm run check:syntax",
+    "check": "npm run check:syntax && npm run test:unit",
     "check:syntax": "node --check index.js && node --check hook-relay.js",
     "check:plugin": "node --check index.js",
-    "check:relay": "node --check hook-relay.js"
+    "check:relay": "node --check hook-relay.js",
+    "test": "npm run test:unit",
+    "test:unit": "node --no-warnings --experimental-loader ./tests/openclaw-loader.mjs --test"
   },
   "openclaw": {
     "extensions": [
