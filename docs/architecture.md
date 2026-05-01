@@ -70,7 +70,13 @@ These are consumed directly from the TeamSpeak media socket and do not pass thro
 ### Text
 
 - TeamSpeak DMs map to an OpenClaw direct session keyed by TeamSpeak UID when available
-- TeamSpeak channel chat maps to an OpenClaw channel session keyed by channel id
+- TeamSpeak channel chat maps to one shared OpenClaw channel session peer id, currently `all`
+- the actual TeamSpeak channel id is still preserved for outbound targeting and route-cache diagnostics
+
+The shared channel session is intentional. The bot acts as one TeamSpeak client,
+and that client can be moved by users or move itself between server channels.
+Splitting OpenClaw context by TeamSpeak channel id would make those channel
+moves look like context loss to users talking to the same bot.
 
 ### Voice
 
@@ -94,10 +100,11 @@ These are consumed directly from the TeamSpeak media socket and do not pass thro
 
 The plugin exposes a gateway method:
 - `teamspeak.voice.status`
+- `teamspeak.voice.debugStatus` for admin-only raw diagnostics
 
 Useful fields include:
 - connection state
-- media socket path / format
-- playback metrics
-- transcription metrics
-- prompt-guidance breadcrumb
+- redacted media socket state / format
+- sanitized playback metrics
+- sanitized transcription metrics
+- dropped ingress, playback, and utterance counters

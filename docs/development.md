@@ -23,6 +23,16 @@ ts events hook list --json
 openclaw gateway call teamspeak.voice.status --json
 ```
 
+Optional local contract smoke:
+
+```bash
+npm run smoke:contracts
+```
+
+This is intentionally outside `npm run check` because it requires live local
+`ts` and OpenClaw CLIs. Use it after runtime or dependency upgrades to validate
+the JSON fields and gateway methods documented in `docs/live-contracts.md`.
+
 ## Safe workflow
 
 1. change the plugin files in this directory
@@ -48,10 +58,11 @@ There is still no standalone automated integration harness for a live OpenClaw g
 - direct gateway diagnostics
 - real TeamSpeak text round-trips
 - real TeamSpeak voice round-trips
+- local live-contract smoke checks for TeamSpeak/OpenClaw JSON shape drift
 
 ## Recommended next formalization steps
 
 When this project grows further, the next sane steps are:
 - split `index.js` into `src/` modules
-- add a repeatable local integration script
+- expand the local contract smoke into a repeatable integration script with captured fixtures
 - move from manual changelog maintenance to tagged releases if it gets a real remote

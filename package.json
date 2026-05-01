@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "check": "npm run check:syntax && npm run test:unit",
-    "check:syntax": "node --check index.js && node --check hook-relay.js",
+    "check:syntax": "node --check index.js && node --check hook-relay.js && node --check scripts/live-contract-smoke.js",
     "check:plugin": "node --check index.js",
     "check:relay": "node --check hook-relay.js",
+    "smoke:contracts": "node scripts/live-contract-smoke.js",
     "test": "npm run test:unit",
     "test:unit": "node --no-warnings --experimental-loader ./tests/openclaw-loader.mjs --test"
   },

@@ -29,7 +29,7 @@ Preserve the current split between:
 - TeamSpeak text ingress through `ts daemon` hooks
 - TeamSpeak voice/media ingress through the dedicated media socket
 
-Do not collapse those paths casually; they solve different problems. Session routing must stay stable: DMs key off sender identity, channel chat keys off TeamSpeak channel id, and accepted voice turns route into the same session model. Outbound TeamSpeak CLI calls must stay argv-based.
+Do not collapse those paths casually; they solve different problems. Session routing must stay stable: DMs key off sender identity. TeamSpeak channel chat intentionally uses one shared channel session peer id because the bot is a single TeamSpeak client that may be moved, or move itself, between server channels; splitting context by TeamSpeak channel id would make those moves unexpectedly lose conversation context. Accepted voice turns route into the same session model. Outbound TeamSpeak CLI calls must stay argv-based.
 
 ## Coding Style & Naming Conventions
 

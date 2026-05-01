@@ -50,6 +50,32 @@ Use this to bias TeamSpeak sessions toward a model/profile optimized for chat or
 
 The plugin applies these to the mapped OpenClaw session before the turn runs.
 
+## Command authorization
+
+TeamSpeak ingress defaults to `CommandAuthorized: false`. Set
+`commandAuthorization` only for TeamSpeak users or channels that should be able
+to trigger downstream OpenClaw commands that trust that field.
+
+```json
+{
+  "channels": {
+    "teamspeak": {
+      "commandAuthorization": {
+        "mode": "allowlist",
+        "allowedHandlers": ["default"],
+        "allowedChannels": ["42"],
+        "allowedUsers": ["uid:abc123", "client:17"]
+      }
+    }
+  }
+}
+```
+
+Modes:
+- `"none"` authorizes no TeamSpeak turns
+- `"allowlist"` authorizes turns matching any listed handler, channel id, UID, or client id
+- `"all"` authorizes every TeamSpeak turn and should only be used on tightly controlled servers
+
 ## Voice config
 
 ```json
@@ -80,6 +106,10 @@ The plugin applies these to the mapped OpenClaw session before the turn runs.
 - `"wake_word"` interrupts only when a finalized utterance is accepted by the wake-word path
 
 Because the current TeamSpeak voice path is finalize-then-transcribe, `"wake_word"` interruption happens after the new utterance is finalized and transcribed, not on the first syllable.
+
+`mode` caveats:
+- `"push_to_talk"` is configured but not currently usable because TeamSpeak media frames do not expose PTT state
+- `"wake_or_ptt"` currently behaves like `"wake_word"` for the same reason; non-wake utterances are dropped
 
 ## STT integration
 
@@ -116,8 +146,23 @@ The plugin uses the normal OpenClaw media-audio path. Example:
 
 The plugin uses OpenClaw `talk.speak` and expects a voice-capable provider already configured in OpenClaw.
 
+For TeamSpeak voice playback, `talk.speak` must return base64 WAV audio. MP3, Opus, raw PCM, and other returned formats are not decoded by this plugin right now.
+
+## Live contract checks
+
+After upgrading `teamspeak-cli`, the TeamSpeak client plugin, or OpenClaw, run:
+
+```bash
+npm run smoke:contracts
+```
+
+See `docs/live-contracts.md` for the exact JSON fields and operational assumptions this checks.
+
 ## Notes
 
 - `defaultTo` is used for proactive outbound TeamSpeak messaging when no stronger route is available
-- `allowedChannels` and `allowedUsers` apply to accepted voice input, not TeamSpeak text chat
+- `voice.allowedChannels` and `voice.allowedUsers` apply to accepted voice input; use `commandAuthorization` for `CommandAuthorized`
 - `mediaSocketPath` is usually best left blank unless the runtime needs an override
+- `teamspeak:dm:<uid>` sends use the volatile UID to client-id cache and fall back to a live client list lookup
+- the ingress secret is stored in the plugin state directory and passed to the hook relay by private secret-file path; keep hook listings and state permissions private on multi-user hosts
+- voice transcription writes temporary WAV files under plugin state and removes them after STT; keep the state directory private and clean stale temp files after unclean exits

@@ -53,6 +53,38 @@
           }
         }
       },
+      "commandAuthorization": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "allowlist",
+              "all"
+            ]
+          },
+          "allowedHandlers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowedChannels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowedUsers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "voice": {
         "type": "object",
         "additionalProperties": false,
@@ -168,10 +200,42 @@
               },
               "thinkingLevel": {
                 "type": "string"
-              }
+          }
+        }
+      },
+      "commandAuthorization": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "allowlist",
+              "all"
+            ]
+          },
+          "allowedHandlers": {
+            "type": "array",
+            "items": {
+              "type": "string"
             }
           },
-          "voice": {
+          "allowedChannels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowedUsers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "voice": {
             "type": "object",
             "additionalProperties": false,
             "properties": {

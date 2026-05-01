@@ -24,15 +24,41 @@ const DEFAULT_INGRESS_PATH = "/plugins/teamspeak/inbound";
 const TEAMSPEAK_CLI_ENV_VARS = ["OPENCLAW_TEAMSPEAK_CLI_PATH", "TEAMSPEAK_CLI_PATH", "TS_CLI_PATH"];
 const ROUTE_CACHE_LIMIT = 256;
 const DEDUPE_TTL_MS = 60 * 1000;
+const ROUTE_CACHE_PERSIST_DEBOUNCE_MS = 100;
+const COMMAND_DEFAULT_TIMEOUT_MS = 30 * 1000;
+const COMMAND_KILL_GRACE_MS = 1000;
+const COMMAND_MAX_STDOUT_BYTES = 1024 * 1024;
+const COMMAND_MAX_STDERR_BYTES = 256 * 1024;
+const TS_COMMAND_TIMEOUT_MS = 15 * 1000;
+const TS_SEND_TIMEOUT_MS = 10 * 1000;
+const OPENCLAW_GATEWAY_TIMEOUT_MS = 35 * 1000;
+const INGRESS_MAX_ACTIVE_DISPATCHES = 4;
+const INGRESS_MAX_QUEUE_DEPTH = 32;
+const INGRESS_DISPATCH_MAX_ATTEMPTS = 2;
+const INGRESS_RETRY_DELAY_MS = 500;
 const DAEMON_RESTART_DELAY_MS = 2000;
 const VOICE_RECONNECT_DELAY_MS = 2000;
 const VOICE_RECONNECT_MAX_DELAY_MS = 60 * 1000;
 const VOICE_RECONNECT_LOG_INTERVAL_MS = 30 * 1000;
 const VOICE_START_DELAY_MS = 5000;
 const VOICE_DEFAULT_SILENCE_TIMEOUT_MS = 1200;
+const VOICE_MEDIA_PROTOCOL_VERSION = "tsmedia1";
+const VOICE_MEDIA_MAX_HEADER_BYTES = 8 * 1024;
+const VOICE_MEDIA_MAX_PAYLOAD_BYTES = 1024 * 1024;
+const VOICE_MEDIA_MAX_BUFFER_BYTES = VOICE_MEDIA_MAX_HEADER_BYTES + VOICE_MEDIA_MAX_PAYLOAD_BYTES;
+const VOICE_MAX_ACTIVE_SPEAKERS = 8;
+const VOICE_MAX_UTTERANCE_BYTES = 16 * 1024 * 1024;
+const VOICE_MAX_UTTERANCE_DURATION_MS = 2 * 60 * 1000;
+const VOICE_TTS_MAX_WAV_BYTES = 10 * 1024 * 1024;
+const VOICE_TTS_MAX_BASE64_CHARS = Math.ceil((VOICE_TTS_MAX_WAV_BYTES * 4) / 3) + 4;
+const VOICE_TTS_MAX_AUDIO_DURATION_MS = 2 * 60 * 1000;
+const VOICE_MAX_WAV_CHANNELS = 8;
+const VOICE_MAX_WAV_SAMPLE_RATE = 96 * 1000;
 const VOICE_WAKE_CACHE_TTL_MS = 30 * 1000;
 const PLAYBACK_SAMPLE_RATE = 48000;
 const PLAYBACK_CHANNELS = 1;
+const VOICE_TTS_MAX_PLAYBACK_BYTES =
+  PLAYBACK_SAMPLE_RATE * PLAYBACK_CHANNELS * 2 * (VOICE_TTS_MAX_AUDIO_DURATION_MS / 1000);
 const PLAYBACK_FORMAT = "pcm_s16le";
 const PLAYBACK_CHUNK_FRAMES = 960;
 const PLAYBACK_CHUNK_DURATION_MS = Math.round((PLAYBACK_CHUNK_FRAMES * 1000) / PLAYBACK_SAMPLE_RATE);
@@ -47,6 +73,7 @@ const TEAMSPEAK_CHANNEL_SESSION_ID = "all";
 const TEAMSPEAK_CHANNEL_CONVERSATION_LABEL = "TeamSpeak channel";
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_RELAY_PATH = path.join(MODULE_DIR, "hook-relay.js");
+const INGRESS_SECRET_FILE_NAME = "ingress-secret.txt";
 
 const runtimeStore = createPluginRuntimeStore({
   pluginId: CHANNEL_ID,
@@ -81,6 +108,8 @@ function createInitialVoiceState() {
     activeSpeakerCount: 0,
     droppedIngressChunks: 0,
     droppedPlaybackChunks: 0,
+    droppedUtterances: 0,
+    lastDroppedUtteranceReason: "",
     lastError: "",
     wakeTriggers: [],
     wakeFetchedAt: 0,
@@ -107,7 +136,12 @@ function createInitialSharedState() {
       dmByUid: new Map(),
       channelById: new Map()
     },
+    routeCacheDirty: false,
+    routeCachePersistTimer: null,
+    routeCachePersistPromise: null,
     dedupeSeenAt: new Map(),
+    ingressQueue: [],
+    ingressActiveDispatches: 0,
     selfIdentity: {
       refreshedAt: 0,
       uid: "",
@@ -123,6 +157,9 @@ const sharedState = createInitialSharedState();
 function resetSharedStateForTests() {
   if (sharedState.daemonRestartTimer) {
     clearTimeout(sharedState.daemonRestartTimer);
+  }
+  if (sharedState.routeCachePersistTimer) {
+    clearTimeout(sharedState.routeCachePersistTimer);
   }
   if (sharedState.voice.startTimer) {
     clearTimeout(sharedState.voice.startTimer);
@@ -166,6 +203,19 @@ function normalizePositiveInteger(value, fallback) {
   if (typeof value === "string") {
     const parsed = Number.parseInt(value.trim(), 10);
     if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function normalizeNonNegativeInteger(value, fallback) {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isInteger(parsed) && parsed >= 0) {
       return parsed;
     }
   }
@@ -235,6 +285,25 @@ function normalizeTeamspeakSessionDefaults(value) {
   };
 }
 
+function normalizeTeamspeakCommandAuthorizationMode(value) {
+  const normalized = normalizeOptionalString(value).toLowerCase();
+  if (normalized === "none" || normalized === "allowlist" || normalized === "all") {
+    return normalized;
+  }
+  return "none";
+}
+
+function normalizeTeamspeakCommandAuthorizationConfig(value) {
+  const commandAuthorization = isRecord(value) ? value : {};
+  return {
+    mode: normalizeTeamspeakCommandAuthorizationMode(commandAuthorization.mode),
+    allowedHandlers: normalizeStringArray(commandAuthorization.allowedHandlers),
+    allowedChannels: normalizeStringArray(commandAuthorization.allowedChannels),
+    allowedUsers: normalizeStringArray(commandAuthorization.allowedUsers),
+    raw: commandAuthorization
+  };
+}
+
 function normalizeIngressPath(value) {
   const trimmed = normalizeOptionalString(value);
   if (!trimmed) {
@@ -298,6 +367,7 @@ function resolveTeamspeakChannelConfig(cfg) {
     ingressPath: normalizeIngressPath(channelConfig.ingressPath),
     daemonPollMs: normalizePositiveInteger(channelConfig.daemonPollMs, DEFAULT_DAEMON_POLL_MS),
     sessionDefaults: normalizeTeamspeakSessionDefaults(channelConfig.sessionDefaults),
+    commandAuthorization: normalizeTeamspeakCommandAuthorizationConfig(channelConfig.commandAuthorization),
     voice: normalizeTeamspeakVoiceConfig(channelConfig.voice),
     raw: channelConfig
   };
@@ -374,6 +444,13 @@ function buildTsGlobalArgs(account, options = {}) {
   return args;
 }
 
+function createCommandFailure(command, args, message, stdout, stderr) {
+  const error = new Error(`${command} ${args.join(" ")} ${message}`);
+  error.stdout = stdout;
+  error.stderr = stderr;
+  return error;
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -382,16 +459,106 @@ function runCommand(command, args, options = {}) {
     });
     let stdout = "";
     let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let killTimer = null;
+    const timeoutMs = normalizePositiveInteger(options.timeoutMs, COMMAND_DEFAULT_TIMEOUT_MS);
+    const maxStdoutBytes = normalizeNonNegativeInteger(options.maxStdoutBytes, COMMAND_MAX_STDOUT_BYTES);
+    const maxStderrBytes = normalizeNonNegativeInteger(options.maxStderrBytes, COMMAND_MAX_STDERR_BYTES);
+    const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+    };
+    const fail = (error, killSignal = "SIGTERM") => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      try {
+        if (!child.killed) {
+          child.kill(killSignal);
+          killTimer = setTimeout(() => {
+            if (!child.killed) {
+              child.kill("SIGKILL");
+            }
+          }, COMMAND_KILL_GRACE_MS);
+          killTimer.unref?.();
+        }
+      } catch {
+        // Ignore process teardown races.
+      }
+      reject(error);
+    };
+    const timeout = setTimeout(() => {
+      fail(
+        createCommandFailure(
+          command,
+          args,
+          `timed out after ${timeoutMs}ms`,
+          stdout,
+          stderr
+        )
+      );
+    }, timeoutMs);
+    timeout.unref?.();
+    const appendOutput = (streamName, chunk) => {
+      const text = String(chunk ?? "");
+      const bytes = Buffer.byteLength(text);
+      if (streamName === "stdout") {
+        if (stdoutBytes + bytes > maxStdoutBytes) {
+          fail(
+            createCommandFailure(
+              command,
+              args,
+              `exceeded stdout limit of ${maxStdoutBytes} bytes`,
+              stdout,
+              stderr
+            )
+          );
+          return;
+        }
+        stdout += text;
+        stdoutBytes += bytes;
+        return;
+      }
+      if (stderrBytes + bytes > maxStderrBytes) {
+        fail(
+          createCommandFailure(
+            command,
+            args,
+            `exceeded stderr limit of ${maxStderrBytes} bytes`,
+            stdout,
+            stderr
+          )
+        );
+        return;
+      }
+      stderr += text;
+      stderrBytes += bytes;
+    };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+      appendOutput("stdout", chunk);
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk;
+      appendOutput("stderr", chunk);
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      fail(error, "SIGTERM");
+    });
     child.on("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
       if (code === 0) {
         resolve({
           code,
@@ -400,12 +567,15 @@ function runCommand(command, args, options = {}) {
         });
         return;
       }
-      const error = new Error(
-        `${command} ${args.join(" ")} failed with exit code ${code ?? "unknown"}: ${stderr.trim() || stdout.trim()}`
+      reject(
+        createCommandFailure(
+          command,
+          args,
+          `failed with exit code ${code ?? "unknown"}: ${stderr.trim() || stdout.trim()}`,
+          stdout,
+          stderr
+        )
       );
-      error.stdout = stdout;
-      error.stderr = stderr;
-      reject(error);
     });
     if (options.stdin !== undefined) {
       child.stdin.end(options.stdin);
@@ -419,16 +589,16 @@ async function runTsJson(account, subcommandArgs) {
   const result = await runCommand(account.cliPath, [
     ...buildTsGlobalArgs(account, { json: true }),
     ...subcommandArgs
-  ]);
+  ], { timeoutMs: TS_COMMAND_TIMEOUT_MS });
   const stdout = result.stdout.trim();
   return stdout ? JSON.parse(stdout) : null;
 }
 
-async function runTsText(account, subcommandArgs) {
+async function runTsText(account, subcommandArgs, options = {}) {
   return await runCommand(account.cliPath, [
     ...buildTsGlobalArgs(account),
     ...subcommandArgs
-  ]);
+  ], { timeoutMs: normalizePositiveInteger(options.timeoutMs, TS_COMMAND_TIMEOUT_MS) });
 }
 
 async function callGatewayJsonViaCli(method, params) {
@@ -436,7 +606,7 @@ async function callGatewayJsonViaCli(method, params) {
   if (params !== undefined) {
     args.push("--params", JSON.stringify(params));
   }
-  const result = await runCommand("openclaw", args);
+  const result = await runCommand("openclaw", args, { timeoutMs: OPENCLAW_GATEWAY_TIMEOUT_MS });
   const stdout = result.stdout.trim();
   return stdout ? JSON.parse(stdout) : null;
 }
@@ -628,9 +798,56 @@ function parseMediaFrameFields(fields) {
   };
 }
 
+function pcmByteDurationMs(byteLength, sampleRate = PLAYBACK_SAMPLE_RATE, channels = PLAYBACK_CHANNELS) {
+  const bytes = Math.max(0, Number(byteLength) || 0);
+  if (bytes === 0 || sampleRate <= 0 || channels <= 0) {
+    return 0;
+  }
+  const frameCount = bytes / Math.max(1, channels * 2);
+  return Math.round((frameCount * 1000) / sampleRate);
+}
+
+function estimateBase64DecodedBytes(value) {
+  const normalized = normalizeOptionalString(value).replace(/\s+/g, "");
+  if (!normalized) {
+    return 0;
+  }
+  const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
+}
+
+function assertTtsAudioBase64WithinLimits(audioBase64) {
+  const normalized = normalizeOptionalString(audioBase64).replace(/\s+/g, "");
+  if (normalized.length > VOICE_TTS_MAX_BASE64_CHARS) {
+    throw new Error(`talk.speak audio exceeds ${VOICE_TTS_MAX_WAV_BYTES} byte decoded limit`);
+  }
+  const decodedBytes = estimateBase64DecodedBytes(normalized);
+  if (decodedBytes > VOICE_TTS_MAX_WAV_BYTES) {
+    throw new Error(`talk.speak audio exceeds ${VOICE_TTS_MAX_WAV_BYTES} byte decoded limit`);
+  }
+}
+
+function validateWavPcmLimits({ dataBytes, durationMs, channels, sampleRate }) {
+  if (channels <= 0 || channels > VOICE_MAX_WAV_CHANNELS) {
+    throw new Error(`WAV channel count exceeds ${VOICE_MAX_WAV_CHANNELS} channel limit`);
+  }
+  if (sampleRate <= 0 || sampleRate > VOICE_MAX_WAV_SAMPLE_RATE) {
+    throw new Error(`WAV sample rate exceeds ${VOICE_MAX_WAV_SAMPLE_RATE} Hz limit`);
+  }
+  if (dataBytes > VOICE_TTS_MAX_WAV_BYTES) {
+    throw new Error(`WAV audio data exceeds ${VOICE_TTS_MAX_WAV_BYTES} byte limit`);
+  }
+  if (durationMs > VOICE_TTS_MAX_AUDIO_DURATION_MS) {
+    throw new Error(`WAV duration exceeds ${VOICE_TTS_MAX_AUDIO_DURATION_MS}ms limit`);
+  }
+}
+
 function parseWavPcmToFloat32(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 44) {
     throw new Error("audio buffer is not a valid WAV file");
+  }
+  if (buffer.length > VOICE_TTS_MAX_WAV_BYTES) {
+    throw new Error(`WAV buffer exceeds ${VOICE_TTS_MAX_WAV_BYTES} byte limit`);
   }
   if (buffer.toString("ascii", 0, 4) !== "RIFF" || buffer.toString("ascii", 8, 12) !== "WAVE") {
     throw new Error("only WAV output is supported for TeamSpeak playback");
@@ -663,6 +880,12 @@ function parseWavPcmToFloat32(buffer) {
   }
   const bytesPerSample = Math.max(1, Math.floor(fmt.bitsPerSample / 8));
   const frameCount = Math.floor(data.length / Math.max(1, bytesPerSample * fmt.channels));
+  validateWavPcmLimits({
+    dataBytes: data.length,
+    durationMs: Math.round((frameCount * 1000) / Math.max(1, fmt.sampleRate)),
+    channels: fmt.channels,
+    sampleRate: fmt.sampleRate
+  });
   const samples = new Float32Array(frameCount * fmt.channels);
   for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
     for (let channelIndex = 0; channelIndex < fmt.channels; channelIndex += 1) {
@@ -712,6 +935,9 @@ function resampleFloat32Mono(samples, inputSampleRate, outputSampleRate) {
     return samples;
   }
   const outputLength = Math.max(1, Math.round((samples.length * outputSampleRate) / inputSampleRate));
+  if (outputLength * 2 > VOICE_TTS_MAX_PLAYBACK_BYTES) {
+    throw new Error(`TeamSpeak playback audio exceeds ${VOICE_TTS_MAX_AUDIO_DURATION_MS}ms duration limit`);
+  }
   const output = new Float32Array(outputLength);
   for (let index = 0; index < outputLength; index += 1) {
     const position = (index * inputSampleRate) / outputSampleRate;
@@ -724,6 +950,9 @@ function resampleFloat32Mono(samples, inputSampleRate, outputSampleRate) {
 }
 
 function float32ToPcm16Buffer(samples) {
+  if (samples.length * 2 > VOICE_TTS_MAX_PLAYBACK_BYTES) {
+    throw new Error(`TeamSpeak playback audio exceeds ${VOICE_TTS_MAX_AUDIO_DURATION_MS}ms duration limit`);
+  }
   const output = Buffer.alloc(samples.length * 2);
   for (let index = 0; index < samples.length; index += 1) {
     const clamped = Math.max(-1, Math.min(1, samples[index]));
@@ -763,6 +992,65 @@ function buildWavBufferFromPcm({ pcmBuffer, sampleRate, channels }) {
 
 function buildMediaHeader(fields) {
   return Buffer.from(`${fields.join("\t")}\n`, "utf8");
+}
+
+function parseMediaPayloadByteLength(fields) {
+  if (fields[1] !== "audio.chunk") {
+    return 0;
+  }
+  const raw = fields[11] || "";
+  if (!/^\d+$/.test(raw)) {
+    throw new Error("TeamSpeak media frame has invalid audio payload length");
+  }
+  const payloadBytes = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(payloadBytes) || payloadBytes > VOICE_MEDIA_MAX_PAYLOAD_BYTES) {
+    throw new Error(`TeamSpeak media audio payload exceeds ${VOICE_MEDIA_MAX_PAYLOAD_BYTES} byte limit`);
+  }
+  return payloadBytes;
+}
+
+function parseVoiceMediaSocketChunk(receiveBuffer, chunk) {
+  let buffer = Buffer.concat([receiveBuffer, chunk]);
+  const frames = [];
+  while (true) {
+    const newlineIndex = buffer.indexOf(0x0a);
+    if (newlineIndex < 0) {
+      if (buffer.length > VOICE_MEDIA_MAX_HEADER_BYTES) {
+        throw new Error(`TeamSpeak media frame header exceeds ${VOICE_MEDIA_MAX_HEADER_BYTES} byte limit`);
+      }
+      return {
+        buffer,
+        frames
+      };
+    }
+    if (newlineIndex > VOICE_MEDIA_MAX_HEADER_BYTES) {
+      throw new Error(`TeamSpeak media frame header exceeds ${VOICE_MEDIA_MAX_HEADER_BYTES} byte limit`);
+    }
+    const header = buffer.subarray(0, newlineIndex).toString("utf8");
+    const fields = header.split("\t");
+    if (fields[0] !== VOICE_MEDIA_PROTOCOL_VERSION) {
+      throw new Error(`unsupported TeamSpeak media protocol ${fields[0] || "<empty>"}`);
+    }
+    const payloadBytes = parseMediaPayloadByteLength(fields);
+    const totalBytes = newlineIndex + 1 + payloadBytes;
+    if (buffer.length < totalBytes) {
+      if (buffer.length > VOICE_MEDIA_MAX_BUFFER_BYTES) {
+        throw new Error(`TeamSpeak media receive buffer exceeds ${VOICE_MEDIA_MAX_BUFFER_BYTES} byte limit`);
+      }
+      return {
+        buffer,
+        frames
+      };
+    }
+    const payload = payloadBytes
+      ? Buffer.from(buffer.subarray(newlineIndex + 1, newlineIndex + 1 + payloadBytes))
+      : Buffer.alloc(0);
+    frames.push({
+      fields,
+      payload
+    });
+    buffer = buffer.subarray(totalBytes);
+  }
 }
 
 function writeMediaFrame(fields, payload = null, socketOverride = null) {
@@ -911,10 +1199,11 @@ function queuedPlaybackBufferMs() {
   return Math.max(0, Math.round((sharedState.voice.queuedPlaybackSamples * 1000) / PLAYBACK_SAMPLE_RATE));
 }
 
-function buildTeamspeakVoiceStatus(cfg) {
+function buildTeamspeakVoiceDebugStatus(cfg) {
+  const account = resolveTeamspeakChannelConfig(cfg);
   return {
-    enabled: resolveTeamspeakChannelConfig(cfg).voice.enabled,
-    sessionDefaults: resolveTeamspeakChannelConfig(cfg).sessionDefaults,
+    enabled: account.voice.enabled,
+    sessionDefaults: account.sessionDefaults,
     connected: sharedState.voice.connected,
     connecting: sharedState.voice.connecting,
     voiceStartPending: Boolean(sharedState.voice.startTimer),
@@ -932,6 +1221,8 @@ function buildTeamspeakVoiceStatus(cfg) {
     activeSpeakerCount: sharedState.voice.activeSpeakerCount,
     droppedIngressChunks: sharedState.voice.droppedIngressChunks,
     droppedPlaybackChunks: sharedState.voice.droppedPlaybackChunks,
+    droppedUtterances: sharedState.voice.droppedUtterances,
+    lastDroppedUtteranceReason: sharedState.voice.lastDroppedUtteranceReason || undefined,
     wakeTriggers: sharedState.voice.wakeTriggers,
     wakeFetchedAt: sharedState.voice.wakeFetchedAt || undefined,
     lastHelloAt: sharedState.voice.lastHelloAt || undefined,
@@ -941,6 +1232,95 @@ function buildTeamspeakVoiceStatus(cfg) {
     lastTranscriptionMetrics: sharedState.voice.lastTranscriptionMetrics || undefined,
     lastPromptGuidance: sharedState.voice.lastPromptGuidance || undefined,
     startupError: sharedState.voice.startupError || undefined
+  };
+}
+
+function diagnosticErrorCode(value) {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    return undefined;
+  }
+  const code = normalizeOptionalString(normalized.split(":")[0]).toLowerCase();
+  return /^[a-z0-9_.-]{1,64}$/.test(code) ? code : "present";
+}
+
+function summarizePlaybackMetrics(metrics) {
+  if (!isRecord(metrics)) {
+    return undefined;
+  }
+  return {
+    source: normalizeOptionalString(metrics.source) || undefined,
+    updatedAt: metrics.updatedAt || undefined,
+    replyChars: metrics.replyChars || undefined,
+    ttsMs: metrics.ttsMs || undefined,
+    wavBytes: metrics.wavBytes || undefined,
+    audioDurationMs: metrics.audioDurationMs || undefined,
+    chunkCount: metrics.chunkCount || undefined,
+    queuePeakMs: metrics.queuePeakMs || undefined,
+    errorPresent: Boolean(metrics.error)
+  };
+}
+
+function summarizeTranscriptionMetrics(metrics) {
+  if (!isRecord(metrics)) {
+    return undefined;
+  }
+  return {
+    source: normalizeOptionalString(metrics.source) || undefined,
+    updatedAt: metrics.updatedAt || undefined,
+    finalizeReason: normalizeOptionalString(metrics.finalizeReason) || undefined,
+    audioDurationMs: metrics.audioDurationMs || undefined,
+    transcriptionDurationMs: metrics.transcriptionDurationMs || undefined,
+    transcriptLength: metrics.transcriptLength || undefined,
+    normalizedTranscriptLength: metrics.normalizedTranscriptLength || undefined,
+    outcome: normalizeOptionalString(metrics.outcome) || undefined,
+    accepted: typeof metrics.accepted === "boolean" ? metrics.accepted : undefined,
+    acceptedReason: normalizeOptionalString(metrics.acceptedReason) || undefined,
+    wakeMatched: typeof metrics.wakeMatched === "boolean" ? metrics.wakeMatched : undefined,
+    provider: normalizeOptionalString(metrics.provider) || undefined,
+    model: normalizeOptionalString(metrics.model) || undefined,
+    language: normalizeOptionalString(metrics.language) || undefined,
+    errorPresent: Boolean(metrics.error)
+  };
+}
+
+function buildTeamspeakVoiceStatus(cfg) {
+  const account = resolveTeamspeakChannelConfig(cfg);
+  return {
+    enabled: account.voice.enabled,
+    sessionDefaults: {
+      model: account.sessionDefaults.model,
+      fastMode: account.sessionDefaults.fastMode,
+      thinkingLevel: account.sessionDefaults.thinkingLevel
+    },
+    connected: sharedState.voice.connected,
+    connecting: sharedState.voice.connecting,
+    voiceStartPending: Boolean(sharedState.voice.startTimer),
+    reconnectAttempt: sharedState.voice.reconnectAttempt || undefined,
+    nextReconnectDelayMs: sharedState.voice.reconnectTimer
+      ? sharedState.voice.lastReconnectDelayMs || undefined
+      : undefined,
+    suppressedConnectionFailures: sharedState.voice.suppressedConnectionFailures || undefined,
+    mediaSocketConfigured: Boolean(sharedState.voice.mediaSocketPath),
+    mediaFormat: sharedState.voice.mediaFormat,
+    mediaTransport: sharedState.voice.mediaTransport,
+    playbackActive: sharedState.voice.playbackActive,
+    queuedPlaybackSamples: sharedState.voice.queuedPlaybackSamples,
+    queuedPlaybackBufferMs: queuedPlaybackBufferMs(),
+    activeSpeakerCount: sharedState.voice.activeSpeakerCount,
+    droppedIngressChunks: sharedState.voice.droppedIngressChunks,
+    droppedPlaybackChunks: sharedState.voice.droppedPlaybackChunks,
+    droppedUtterances: sharedState.voice.droppedUtterances,
+    lastDroppedUtteranceReason: sharedState.voice.lastDroppedUtteranceReason || undefined,
+    wakeTriggerCount: sharedState.voice.wakeTriggers.length,
+    wakeFetchedAt: sharedState.voice.wakeFetchedAt || undefined,
+    lastHelloAt: sharedState.voice.lastHelloAt || undefined,
+    lastStatusAt: sharedState.voice.lastStatusAt || undefined,
+    lastErrorPresent: Boolean(sharedState.voice.lastError),
+    lastErrorCode: diagnosticErrorCode(sharedState.voice.lastError),
+    lastPlaybackMetrics: summarizePlaybackMetrics(sharedState.voice.lastPlaybackMetrics),
+    lastTranscriptionMetrics: summarizeTranscriptionMetrics(sharedState.voice.lastTranscriptionMetrics),
+    startupErrorPresent: Boolean(sharedState.voice.startupError)
   };
 }
 
@@ -1018,6 +1398,7 @@ async function synthesizeTeamspeakReplyAudio(text, logger = null) {
       if (!audioBase64) {
         throw new Error("talk.speak returned no audio payload");
       }
+      assertTtsAudioBase64WithinLimits(audioBase64);
       const audioBuffer = Buffer.from(audioBase64, "base64");
       const outputFormat = normalizeOptionalString(payload?.outputFormat).toLowerCase();
       const fileExtension = normalizeOptionalString(payload?.fileExtension).toLowerCase();
@@ -1207,9 +1588,59 @@ function resolveGatewayBaseUrl(cfg) {
 function ensureTeamspeakStateDir(stateDir) {
   const target = path.join(stateDir, CHANNEL_ID);
   fs.mkdirSync(target, {
-    recursive: true
+    recursive: true,
+    mode: 0o700
   });
+  ensureOwnerPrivateDirectory(target, "TeamSpeak state directory");
   return target;
+}
+
+function ensureOwnerPrivateDirectory(dirPath, label) {
+  const stat = fs.lstatSync(dirPath);
+  if (!stat.isDirectory()) {
+    throw new Error(`${label} is not a directory: ${dirPath}`);
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`${label} is not owned by the current user: ${dirPath}`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    fs.chmodSync(dirPath, 0o700);
+  }
+}
+
+function ingressSecretFilePath(stateDir) {
+  return stateDir ? path.join(stateDir, INGRESS_SECRET_FILE_NAME) : "";
+}
+
+function writePrivateTextFile(filePath, value) {
+  const fd = fs.openSync(
+    filePath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW ?? 0),
+    0o600
+  );
+  try {
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, value);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function ensureOwnerPrivateRegularFile(filePath, label) {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile()) {
+    throw new Error(`${label} is not a regular file: ${filePath}`);
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`${label} is not owned by the current user: ${filePath}`);
+  }
+  const exposed = (stat.mode & 0o077) !== 0;
+  if (exposed || (stat.mode & 0o777) !== 0o600) {
+    fs.chmodSync(filePath, 0o600);
+  }
+  return {
+    exposed
+  };
 }
 
 function readTextFileIfExists(filePath) {
@@ -1220,23 +1651,28 @@ function readTextFileIfExists(filePath) {
   }
 }
 
-function writeJsonFile(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), {
-    recursive: true
-  });
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
-}
-
 function ensureIngressSecret(stateDir) {
-  const filePath = path.join(stateDir, "ingress-secret.txt");
-  const existing = readTextFileIfExists(filePath).trim();
+  fs.mkdirSync(stateDir, {
+    recursive: true,
+    mode: 0o700
+  });
+  ensureOwnerPrivateDirectory(stateDir, "TeamSpeak state directory");
+
+  const filePath = ingressSecretFilePath(stateDir);
+  let existing = "";
+  try {
+    const checked = ensureOwnerPrivateRegularFile(filePath, "TeamSpeak ingress secret file");
+    existing = checked.exposed ? "" : readTextFileIfExists(filePath).trim();
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
   if (existing) {
     return existing;
   }
   const created = randomBytes(24).toString("hex");
-  fs.writeFileSync(filePath, `${created}\n`, {
-    mode: 0o600
-  });
+  writePrivateTextFile(filePath, `${created}\n`);
   return created;
 }
 
@@ -1298,46 +1734,116 @@ function trimMapToLimit(map, limit) {
   }
 }
 
-function persistRouteCache() {
-  const filePath = routeCacheFilePath();
-  if (!filePath) {
-    return;
-  }
-  writeJsonFile(filePath, {
+function routeCacheSnapshot() {
+  return {
     dmByUid: [...sharedState.routeCache.dmByUid.values()],
     channelById: [...sharedState.routeCache.channelById.values()]
+  };
+}
+
+async function writeRouteCacheFile(filePath, value) {
+  await fs.promises.mkdir(path.dirname(filePath), {
+    recursive: true
   });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.promises.writeFile(tempPath, JSON.stringify(value, null, 2));
+  await fs.promises.rename(tempPath, filePath);
+}
+
+async function flushRouteCachePersist() {
+  if (sharedState.routeCachePersistTimer) {
+    clearTimeout(sharedState.routeCachePersistTimer);
+    sharedState.routeCachePersistTimer = null;
+  }
+  if (sharedState.routeCachePersistPromise) {
+    await sharedState.routeCachePersistPromise;
+  }
+  const filePath = routeCacheFilePath();
+  if (!filePath) {
+    sharedState.routeCacheDirty = false;
+    return;
+  }
+  while (sharedState.routeCacheDirty) {
+    sharedState.routeCacheDirty = false;
+    const snapshot = routeCacheSnapshot();
+    const writePromise = writeRouteCacheFile(filePath, snapshot);
+    sharedState.routeCachePersistPromise = writePromise;
+    try {
+      await writePromise;
+    } catch (error) {
+      sharedState.routeCacheDirty = true;
+      throw error;
+    } finally {
+      if (sharedState.routeCachePersistPromise === writePromise) {
+        sharedState.routeCachePersistPromise = null;
+      }
+    }
+  }
+}
+
+function scheduleRouteCachePersist() {
+  sharedState.routeCacheDirty = true;
+  if (!routeCacheFilePath() || sharedState.routeCachePersistTimer) {
+    return;
+  }
+  sharedState.routeCachePersistTimer = setTimeout(() => {
+    sharedState.routeCachePersistTimer = null;
+    flushRouteCachePersist().catch(() => {});
+  }, ROUTE_CACHE_PERSIST_DEBOUNCE_MS);
+  sharedState.routeCachePersistTimer.unref?.();
 }
 
 function updateDmRouteCache(entry) {
   sharedState.routeCache.dmByUid.set(entry.uid, entry);
   trimMapToLimit(sharedState.routeCache.dmByUid, ROUTE_CACHE_LIMIT);
-  persistRouteCache();
+  scheduleRouteCachePersist();
 }
 
 function updateChannelRouteCache(entry) {
   sharedState.routeCache.channelById.set(entry.channelId, entry);
   trimMapToLimit(sharedState.routeCache.channelById, ROUTE_CACHE_LIMIT);
-  persistRouteCache();
+  scheduleRouteCachePersist();
 }
 
 function pruneDedupeCache(now) {
   for (const [key, seenAt] of sharedState.dedupeSeenAt.entries()) {
-    if (now - seenAt > DEDUPE_TTL_MS) {
+    const timestamp = isRecord(seenAt) ? seenAt.seenAt : seenAt;
+    if (now - timestamp > DEDUPE_TTL_MS) {
       sharedState.dedupeSeenAt.delete(key);
     }
   }
 }
 
-function claimInboundFingerprint(fingerprint) {
+function claimInboundFingerprint(fingerprint, state = "inflight") {
   const now = Date.now();
   pruneDedupeCache(now);
-  if (sharedState.dedupeSeenAt.has(fingerprint)) {
+  const existing = sharedState.dedupeSeenAt.get(fingerprint);
+  if (existing !== undefined) {
     return false;
   }
-  sharedState.dedupeSeenAt.set(fingerprint, now);
+  sharedState.dedupeSeenAt.set(fingerprint, {
+    state,
+    seenAt: now
+  });
   trimMapToLimit(sharedState.dedupeSeenAt, ROUTE_CACHE_LIMIT * 4);
   return true;
+}
+
+function commitInboundFingerprint(fingerprint) {
+  if (!sharedState.dedupeSeenAt.has(fingerprint)) {
+    return;
+  }
+  sharedState.dedupeSeenAt.set(fingerprint, {
+    state: "done",
+    seenAt: Date.now()
+  });
+}
+
+function releaseInboundFingerprint(fingerprint) {
+  const entry = sharedState.dedupeSeenAt.get(fingerprint);
+  if (entry !== undefined && entry?.state !== "done") {
+    sharedState.dedupeSeenAt.delete(fingerprint);
+  }
 }
 
 function parseTimestamp(value) {
@@ -1550,6 +2056,56 @@ function resolveTeamspeakOutboundTarget(raw) {
   };
 }
 
+async function resolveLiveClientByUid(account, uid) {
+  const normalizedUid = normalizeOptionalString(uid);
+  if (!normalizedUid) {
+    return null;
+  }
+  const clients = await runTsJson(account, ["client", "list"]);
+  if (!Array.isArray(clients)) {
+    return null;
+  }
+  const entry = clients.find((candidate) => {
+    if (!isRecord(candidate)) {
+      return false;
+    }
+    const candidateUid =
+      normalizeOptionalString(candidate.unique_identity) ||
+      normalizeOptionalString(candidate.uniqueIdentity) ||
+      normalizeOptionalString(candidate.uid);
+    return candidateUid === normalizedUid;
+  });
+  if (!isRecord(entry)) {
+    return null;
+  }
+  const clientId = normalizeOptionalString(entry.id) || normalizeOptionalString(entry.client_id);
+  if (!clientId) {
+    return null;
+  }
+  return {
+    uid: normalizedUid,
+    clientId,
+    senderName: normalizeOptionalString(entry.nickname),
+    sessionKey: "",
+    updatedAt: Date.now()
+  };
+}
+
+async function refreshDmRouteCacheForTarget(account, targetRef) {
+  const parsed = parseTeamspeakTarget(targetRef);
+  if (parsed?.kind !== "dm") {
+    return;
+  }
+  const uid = normalizeOptionalString(parsed.uid);
+  if (!uid || sharedState.routeCache.dmByUid.get(uid)?.clientId) {
+    return;
+  }
+  const resolved = await resolveLiveClientByUid(account, uid);
+  if (resolved) {
+    updateDmRouteCache(resolved);
+  }
+}
+
 function buildTeamspeakTextSendArgs(targetRef, text) {
   const trimmedText = String(text ?? "").trim();
   if (!trimmedText) {
@@ -1573,8 +2129,9 @@ function buildTeamspeakTextSendArgs(targetRef, text) {
 }
 
 async function sendTeamspeakText(account, targetRef, text) {
+  await refreshDmRouteCacheForTarget(account, targetRef);
   const command = buildTeamspeakTextSendArgs(targetRef, text);
-  await runTsText(account, command.args);
+  await runTsText(account, command.args, { timeoutMs: TS_SEND_TIMEOUT_MS });
   return {
     channel: CHANNEL_ID,
     messageId: `teamspeak-${Date.now()}`,
@@ -1794,13 +2351,17 @@ function hookUrlForConfig(cfg) {
 }
 
 function buildHookExecCommand(cfg) {
+  const secretFile = ingressSecretFilePath(sharedState.routeStateDir);
+  if (!secretFile) {
+    throw new Error("TeamSpeak ingress secret file path is not initialized");
+  }
   return [
     shellQuote(process.execPath),
     shellQuote(HOOK_RELAY_PATH),
     "--url",
     shellQuote(hookUrlForConfig(cfg)),
-    "--secret",
-    shellQuote(sharedState.ingressSecret)
+    "--secret-file",
+    shellQuote(secretFile)
   ].join(" ");
 }
 
@@ -2022,6 +2583,70 @@ function isSelfInboundMessage(normalized, selfIdentity) {
   );
 }
 
+function isNicknameOnlySelfMessageMatch(normalized, selfIdentity) {
+  const senderUid = normalizeOptionalString(normalized?.sender?.uid);
+  const senderId = normalizeOptionalString(normalized?.sender?.id);
+  const senderName = normalizeOptionalString(normalized?.sender?.name);
+  const selfNickname = normalizeOptionalString(selfIdentity?.nickname);
+  return Boolean(!senderUid && !senderId && senderName && selfNickname && senderName === selfNickname);
+}
+
+async function ensureInboundDmReplyTarget(account, normalized, logger) {
+  if (normalized.messageKind !== "client" || normalizeOptionalString(normalized.sender?.id)) {
+    return true;
+  }
+  const uid = normalizeOptionalString(normalized.sender?.uid);
+  if (!uid) {
+    return false;
+  }
+  try {
+    const resolved = await resolveLiveClientByUid(account, uid);
+    if (!resolved?.clientId) {
+      return false;
+    }
+    normalized.sender.id = resolved.clientId;
+    if (!normalizeOptionalString(normalized.sender.name) && resolved.senderName) {
+      normalized.sender.name = resolved.senderName;
+    }
+    updateDmRouteCache(resolved);
+    return true;
+  } catch (error) {
+    logger.warn?.(`[teamspeak] failed to resolve TeamSpeak client id for ${uid}: ${String(error)}`);
+    return false;
+  }
+}
+
+function isTeamspeakCommandAuthorized(normalized, commandAuthorization) {
+  const auth = isRecord(commandAuthorization) ? commandAuthorization : {};
+  const mode = normalizeTeamspeakCommandAuthorizationMode(auth.mode);
+  if (mode === "all") {
+    return true;
+  }
+  if (mode !== "allowlist") {
+    return false;
+  }
+  const allowedHandlers = Array.isArray(auth.allowedHandlers) ? auth.allowedHandlers : [];
+  const allowedChannels = Array.isArray(auth.allowedChannels) ? auth.allowedChannels : [];
+  const allowedUsers = Array.isArray(auth.allowedUsers) ? auth.allowedUsers : [];
+  const handler = normalizeOptionalString(normalized.handler);
+  if (handler && allowedHandlers.includes(handler)) {
+    return true;
+  }
+  const channelId = normalizeOptionalString(normalized.target?.id);
+  if (normalized.messageKind === "channel" && channelId && allowedChannels.includes(channelId)) {
+    return true;
+  }
+  const senderUid = normalizeOptionalString(normalized.sender?.uid);
+  const senderId = normalizeOptionalString(normalized.sender?.id);
+  const userCandidates = [
+    senderUid,
+    senderUid ? `uid:${senderUid}` : "",
+    senderId,
+    senderId ? `client:${senderId}` : ""
+  ].filter(Boolean);
+  return userCandidates.some((entry) => allowedUsers.includes(entry));
+}
+
 function attachDaemonLogStream(stream, logFn, prefix) {
   if (!stream || !logFn) {
     return;
@@ -2108,213 +2733,241 @@ function buildTeamspeakVoiceReplySystemPrompt(normalized) {
   ].join(" ");
 }
 
-async function dispatchTeamspeakTurn({ cfg, normalized, logger, deliverReply, extraUntrustedContext }) {
-  if (!claimInboundFingerprint(normalized.fingerprint)) {
+async function dispatchTeamspeakTurn({
+  cfg,
+  normalized,
+  logger,
+  deliverReply,
+  extraUntrustedContext,
+  fingerprintClaimed = false
+}) {
+  if (!fingerprintClaimed && !claimInboundFingerprint(normalized.fingerprint)) {
     return {
       handled: true,
       deduped: true
     };
   }
-  const runtime = runtimeStore.getRuntime();
-  const account = resolveTeamspeakChannelConfig(cfg);
-  const selfIdentity = await readSelfIdentity(cfg);
-  if (isSelfInboundMessage(normalized, selfIdentity)) {
-    logger.info?.("[teamspeak] ignoring self-authored inbound message");
-    return {
-      handled: true,
-      deduped: false,
-      ignored: "self-message"
-    };
-  }
-  if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
-    let resolvedChannelId = await resolveLiveSpeakerChannelId(
-      cfg,
-      {
-        channelId: normalized.target?.id,
-        clientId: normalized.sender?.id,
-        uid: normalized.sender?.uid,
-        nickname: normalized.sender?.name
-      },
-      logger
-    );
-    if (!isUsableTeamspeakChannelId(resolvedChannelId)) {
-      resolvedChannelId = await resolveLiveSpeakerChannelId(
+  try {
+    const runtime = runtimeStore.getRuntime();
+    const account = resolveTeamspeakChannelConfig(cfg);
+    const selfIdentity = await readSelfIdentity(cfg);
+    if (isSelfInboundMessage(normalized, selfIdentity)) {
+      if (isNicknameOnlySelfMessageMatch(normalized, selfIdentity)) {
+        logger.warn?.("[teamspeak] ignoring self-authored inbound message using nickname-only identity fallback");
+      }
+      logger.info?.("[teamspeak] ignoring self-authored inbound message");
+      commitInboundFingerprint(normalized.fingerprint);
+      return {
+        handled: true,
+        deduped: false,
+        ignored: "self-message"
+      };
+    }
+    if (!(await ensureInboundDmReplyTarget(account, normalized, logger))) {
+      logger.warn?.(
+        `[teamspeak] ignoring DM from ${normalizeOptionalString(normalized.sender?.uid) || "<unknown>"} because no current client id is available`
+      );
+      commitInboundFingerprint(normalized.fingerprint);
+      return {
+        handled: true,
+        deduped: false,
+        ignored: "dm-missing-reply-target"
+      };
+    }
+    if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
+      let resolvedChannelId = await resolveLiveSpeakerChannelId(
         cfg,
         {
-          clientId: selfIdentity.clientId,
-          uid: selfIdentity.uid,
-          nickname: selfIdentity.nickname
+          channelId: normalized.target?.id,
+          clientId: normalized.sender?.id,
+          uid: normalized.sender?.uid,
+          nickname: normalized.sender?.name
         },
         logger
       );
+      if (!isUsableTeamspeakChannelId(resolvedChannelId)) {
+        resolvedChannelId = await resolveLiveSpeakerChannelId(
+          cfg,
+          {
+            clientId: selfIdentity.clientId,
+            uid: selfIdentity.uid,
+            nickname: selfIdentity.nickname
+          },
+          logger
+        );
+      }
+      if (isUsableTeamspeakChannelId(resolvedChannelId)) {
+        logger.info?.(
+          `[teamspeak] corrected channel message target: ${normalized.target?.id || "<empty>"} -> ${resolvedChannelId}`
+        );
+        normalized.target.id = resolvedChannelId;
+      }
     }
-    if (isUsableTeamspeakChannelId(resolvedChannelId)) {
-      logger.info?.(
-        `[teamspeak] corrected channel message target: ${normalized.target?.id || "<empty>"} -> ${resolvedChannelId}`
-      );
-      normalized.target.id = resolvedChannelId;
+    if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
+      throw new Error(`channel message has unresolved TeamSpeak channel id ${normalized.target?.id || "<empty>"}`);
     }
-  }
-  if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
-    throw new Error(`channel message has unresolved TeamSpeak channel id ${normalized.target?.id || "<empty>"}`);
-  }
-  const sessionPeerId =
-    normalized.messageKind === "client"
-      ? normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)
-      : TEAMSPEAK_CHANNEL_SESSION_ID;
-  const route = runtime.channel.routing.resolveAgentRoute({
-    cfg,
-    channel: CHANNEL_ID,
-    accountId: account.accountId,
-    peer: {
-      kind: normalized.messageKind === "client" ? "direct" : "channel",
-      id: sessionPeerId
-    }
-  });
-  const storePath = runtime.channel.session.resolveStorePath(cfg.session?.store, {
-    agentId: route.agentId
-  });
-  await maybeApplyTeamspeakSessionDefaults({
-    storePath,
-    sessionKey: route.sessionKey,
-    sessionDefaults: account.sessionDefaults,
-    logger
-  });
-  const previousTimestamp = runtime.channel.session.readSessionUpdatedAt({
-    storePath,
-    sessionKey: route.sessionKey
-  });
-  const conversationLabel =
-    normalized.messageKind === "client"
-      ? normalizeOptionalString(normalized.sender.name) ||
-        normalizeOptionalString(normalized.sender.uid) ||
-        normalizeOptionalString(normalized.sender.id)
-      : TEAMSPEAK_CHANNEL_CONVERSATION_LABEL;
-  const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
-  const body = runtime.channel.reply.formatAgentEnvelope({
-    channel: "TeamSpeak",
-    from: conversationLabel,
-    timestamp: normalized.timestamp,
-    previousTimestamp,
-    envelope: envelopeOptions,
-    body: normalized.text
-  });
-  const originatingTo =
-    normalized.messageKind === "client"
-      ? `teamspeak:dm:${normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)}`
-      : `teamspeak:channel:${normalized.target.id}`;
-  const untrustedContext = [
-    ...(normalized.handler ? [`TeamSpeak handler: ${normalized.handler}`] : []),
-    ...(normalized.messageKind === "channel" ? [`TeamSpeak current channel id: ${normalized.target.id}`] : []),
-    ...(Array.isArray(extraUntrustedContext) ? extraUntrustedContext.filter(Boolean) : [])
-  ];
-  const groupSystemPrompt = buildTeamspeakVoiceReplySystemPrompt(normalized);
-  if (groupSystemPrompt) {
-    sharedState.voice.lastPromptGuidance = {
-      updatedAt: Date.now(),
-      eventType: normalized.eventType,
-      prompt: groupSystemPrompt
-    };
-    logger.info?.(`[teamspeak voice] attached voice reply guidance (${groupSystemPrompt.length} chars)`);
-  }
-  const voiceReplyStream = normalized.eventType === "voice.utterance" ? createTeamspeakVoiceReplyStreamController({
-    account,
-    originatingTo,
-    cfg,
-    logger
-  }) : null;
-  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
-    Body: body,
-    BodyForAgent: normalized.text,
-    RawBody: normalized.text,
-    CommandBody: normalized.text,
-    GroupSystemPrompt: groupSystemPrompt,
-    From:
+    const sessionPeerId =
       normalized.messageKind === "client"
-        ? `teamspeak:user:${normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)}`
-        : `teamspeak:channel:${normalized.target.id}`,
-    To: originatingTo,
-    SessionKey: route.sessionKey,
-    AccountId: route.accountId,
-    ChatType: normalized.messageKind === "client" ? "direct" : "channel",
-    ConversationLabel: conversationLabel,
-    SenderName: normalizeOptionalString(normalized.sender.name) || undefined,
-    SenderId: normalizeOptionalString(normalized.sender.id) || undefined,
-    SenderTag: normalizeOptionalString(normalized.sender.uid) || undefined,
-    NativeDirectUserId:
-      normalized.messageKind === "client" ? normalizeOptionalString(normalized.sender.uid) || undefined : undefined,
-    GroupSubject:
-      normalized.messageKind === "channel" ? TEAMSPEAK_CHANNEL_CONVERSATION_LABEL : undefined,
-    Provider: CHANNEL_ID,
-    Surface: CHANNEL_ID,
-    MessageSid: normalized.fingerprint,
-    Timestamp: normalized.timestamp,
-    OriginatingChannel: CHANNEL_ID,
-    OriginatingTo: originatingTo,
-    CommandAuthorized: true,
-    UntrustedContext: untrustedContext.length > 0 ? untrustedContext : undefined
-  });
-  if (normalized.messageKind === "client") {
-    const uid = normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id);
-    const clientId = normalizeOptionalString(normalized.sender.id);
-    if (uid && clientId) {
-      updateDmRouteCache({
-        uid,
-        clientId,
-        senderName: normalizeOptionalString(normalized.sender.name),
+        ? normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)
+        : TEAMSPEAK_CHANNEL_SESSION_ID;
+    const route = runtime.channel.routing.resolveAgentRoute({
+      cfg,
+      channel: CHANNEL_ID,
+      accountId: account.accountId,
+      peer: {
+        kind: normalized.messageKind === "client" ? "direct" : "channel",
+        id: sessionPeerId
+      }
+    });
+    const storePath = runtime.channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: route.agentId
+    });
+    await maybeApplyTeamspeakSessionDefaults({
+      storePath,
+      sessionKey: route.sessionKey,
+      sessionDefaults: account.sessionDefaults,
+      logger
+    });
+    const previousTimestamp = runtime.channel.session.readSessionUpdatedAt({
+      storePath,
+      sessionKey: route.sessionKey
+    });
+    const conversationLabel =
+      normalized.messageKind === "client"
+        ? normalizeOptionalString(normalized.sender.name) ||
+          normalizeOptionalString(normalized.sender.uid) ||
+          normalizeOptionalString(normalized.sender.id)
+        : TEAMSPEAK_CHANNEL_CONVERSATION_LABEL;
+    const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
+    const body = runtime.channel.reply.formatAgentEnvelope({
+      channel: "TeamSpeak",
+      from: conversationLabel,
+      timestamp: normalized.timestamp,
+      previousTimestamp,
+      envelope: envelopeOptions,
+      body: normalized.text
+    });
+    const originatingTo =
+      normalized.messageKind === "client"
+        ? `teamspeak:dm:${normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)}`
+        : `teamspeak:channel:${normalized.target.id}`;
+    const untrustedContext = [
+      ...(normalized.handler ? [`TeamSpeak handler: ${normalized.handler}`] : []),
+      ...(normalized.messageKind === "channel" ? [`TeamSpeak current channel id: ${normalized.target.id}`] : []),
+      ...(Array.isArray(extraUntrustedContext) ? extraUntrustedContext.filter(Boolean) : [])
+    ];
+    const groupSystemPrompt = buildTeamspeakVoiceReplySystemPrompt(normalized);
+    if (groupSystemPrompt) {
+      sharedState.voice.lastPromptGuidance = {
+        updatedAt: Date.now(),
+        eventType: normalized.eventType,
+        prompt: groupSystemPrompt
+      };
+      logger.info?.(`[teamspeak voice] attached voice reply guidance (${groupSystemPrompt.length} chars)`);
+    }
+    const voiceReplyStream = normalized.eventType === "voice.utterance" ? createTeamspeakVoiceReplyStreamController({
+      account,
+      originatingTo,
+      cfg,
+      logger
+    }) : null;
+    const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+      Body: body,
+      BodyForAgent: normalized.text,
+      RawBody: normalized.text,
+      CommandBody: normalized.text,
+      GroupSystemPrompt: groupSystemPrompt,
+      From:
+        normalized.messageKind === "client"
+          ? `teamspeak:user:${normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)}`
+          : `teamspeak:channel:${normalized.target.id}`,
+      To: originatingTo,
+      SessionKey: route.sessionKey,
+      AccountId: route.accountId,
+      ChatType: normalized.messageKind === "client" ? "direct" : "channel",
+      ConversationLabel: conversationLabel,
+      SenderName: normalizeOptionalString(normalized.sender.name) || undefined,
+      SenderId: normalizeOptionalString(normalized.sender.id) || undefined,
+      SenderTag: normalizeOptionalString(normalized.sender.uid) || undefined,
+      NativeDirectUserId:
+        normalized.messageKind === "client" ? normalizeOptionalString(normalized.sender.uid) || undefined : undefined,
+      GroupSubject:
+        normalized.messageKind === "channel" ? TEAMSPEAK_CHANNEL_CONVERSATION_LABEL : undefined,
+      Provider: CHANNEL_ID,
+      Surface: CHANNEL_ID,
+      MessageSid: normalized.fingerprint,
+      Timestamp: normalized.timestamp,
+      OriginatingChannel: CHANNEL_ID,
+      OriginatingTo: originatingTo,
+      CommandAuthorized: isTeamspeakCommandAuthorized(normalized, account.commandAuthorization),
+      UntrustedContext: untrustedContext.length > 0 ? untrustedContext : undefined
+    });
+    if (normalized.messageKind === "client") {
+      const uid = normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id);
+      const clientId = normalizeOptionalString(normalized.sender.id);
+      if (uid && clientId) {
+        updateDmRouteCache({
+          uid,
+          clientId,
+          senderName: normalizeOptionalString(normalized.sender.name),
+          sessionKey: route.sessionKey,
+          updatedAt: normalized.timestamp
+        });
+      }
+    } else {
+      updateChannelRouteCache({
+        channelId: normalizeOptionalString(normalized.target.id),
         sessionKey: route.sessionKey,
         updatedAt: normalized.timestamp
       });
     }
-  } else {
-    updateChannelRouteCache({
-      channelId: normalizeOptionalString(normalized.target.id),
-      sessionKey: route.sessionKey,
-      updatedAt: normalized.timestamp
+    await dispatchInboundReplyWithBase({
+      cfg,
+      channel: CHANNEL_ID,
+      accountId: account.accountId,
+      route,
+      storePath,
+      ctxPayload,
+      core: runtime,
+      deliver: async (payload) => {
+        await deliverReply(payload, {
+          normalized,
+          route,
+          originatingTo,
+          account,
+          cfg,
+          logger,
+          voiceReplyStream
+        });
+      },
+      onRecordError: (error) => {
+        logger.error?.(`[teamspeak] failed to record inbound session: ${String(error)}`);
+      },
+      onDispatchError: (error, info) => {
+        logger.error?.(`[teamspeak] ${info.kind} reply failed: ${String(error)}`);
+      },
+      replyOptions: voiceReplyStream ? {
+        onPartialReply: (payload) => {
+          voiceReplyStream.onPartialReply(payload?.text);
+        },
+        onAssistantMessageStart: () => {
+          voiceReplyStream.onAssistantMessageStart();
+        },
+        onToolStart: () => {
+          voiceReplyStream.onToolStart();
+        }
+      } : undefined
     });
+    commitInboundFingerprint(normalized.fingerprint);
+    return {
+      handled: true,
+      deduped: false,
+      sessionKey: route.sessionKey
+    };
+  } catch (error) {
+    releaseInboundFingerprint(normalized.fingerprint);
+    throw error;
   }
-  await dispatchInboundReplyWithBase({
-    cfg,
-    channel: CHANNEL_ID,
-    accountId: account.accountId,
-    route,
-    storePath,
-    ctxPayload,
-    core: runtime,
-    deliver: async (payload) => {
-      await deliverReply(payload, {
-        normalized,
-        route,
-        originatingTo,
-        account,
-        cfg,
-        logger,
-        voiceReplyStream
-      });
-    },
-    onRecordError: (error) => {
-      logger.error?.(`[teamspeak] failed to record inbound session: ${String(error)}`);
-    },
-    onDispatchError: (error, info) => {
-      logger.error?.(`[teamspeak] ${info.kind} reply failed: ${String(error)}`);
-    },
-    replyOptions: voiceReplyStream ? {
-      onPartialReply: (payload) => {
-        voiceReplyStream.onPartialReply(payload?.text);
-      },
-      onAssistantMessageStart: () => {
-        voiceReplyStream.onAssistantMessageStart();
-      },
-      onToolStart: () => {
-        voiceReplyStream.onToolStart();
-      }
-    } : undefined
-  });
-  return {
-    handled: true,
-    deduped: false,
-    sessionKey: route.sessionKey
-  };
 }
 
 function buildVoiceNormalizedEvent(speakerState, text) {
@@ -2422,7 +3075,7 @@ async function finalizeSpeakerUtterance(cfg, speakerKey, logger, reason) {
   if (speakerState.chunks.length === 0) {
     return;
   }
-  const pcmBuffer = Buffer.concat(speakerState.chunks);
+  const pcmBuffer = Buffer.concat(speakerState.chunks, speakerState.byteLength || undefined);
   const wavBuffer = buildWavBufferFromPcm({
     pcmBuffer,
     sampleRate: speakerState.sampleRate,
@@ -2586,6 +3239,11 @@ function scheduleVoiceReconnect(cfg, logger, failureMessage = "") {
 function handleVoiceMediaFrame(cfg, frame, logger) {
   const voiceState = sharedState.voice;
   const type = frame.fields[1] || "";
+  if (frame.fields[0] && frame.fields[0] !== VOICE_MEDIA_PROTOCOL_VERSION) {
+    voiceState.lastError = `unsupported media protocol ${frame.fields[0]}`;
+    logger.warn?.(`[teamspeak voice] ${voiceState.lastError}`);
+    return;
+  }
   if (type === "hello") {
     voiceState.lastHelloAt = Date.now();
     voiceState.mediaFormat = hexDecode(frame.fields[3]);
@@ -2651,6 +3309,12 @@ function handleVoiceMediaFrame(cfg, frame, logger) {
     ) {
       clearTeamspeakPlayback(logger, `speaker-start:${speakerKey}`).catch(() => {});
     }
+    if (!voiceState.speakers.has(speakerKey) && voiceState.speakers.size >= VOICE_MAX_ACTIVE_SPEAKERS) {
+      voiceState.droppedUtterances += 1;
+      voiceState.lastDroppedUtteranceReason = "active-speaker-limit";
+      logger.warn?.(`[teamspeak voice] dropped speaker ${speakerKey}: active speaker limit reached`);
+      return;
+    }
     const speakerState = {
       key: speakerKey,
       handlerId: parsed.handlerId,
@@ -2661,6 +3325,9 @@ function handleVoiceMediaFrame(cfg, frame, logger) {
       sampleRate: parsed.sampleRate || PLAYBACK_SAMPLE_RATE,
       channels: parsed.channels || 1,
       chunks: [],
+      byteLength: 0,
+      startedAt: Date.now(),
+      lastChunkAt: 0,
       finalizeTimer: null
     };
     voiceState.speakers.set(speakerKey, speakerState);
@@ -2673,7 +3340,22 @@ function handleVoiceMediaFrame(cfg, frame, logger) {
   }
   if (type === "audio.chunk") {
     if (frame.payload?.length) {
-      speakerState.chunks.push(frame.payload);
+      const sampleRate = parsed.sampleRate || speakerState.sampleRate;
+      const channels = parsed.channels || speakerState.channels;
+      const nextByteLength = speakerState.byteLength + frame.payload.length;
+      const durationMs = pcmByteDurationMs(nextByteLength, sampleRate, channels);
+      if (nextByteLength > VOICE_MAX_UTTERANCE_BYTES || durationMs > VOICE_MAX_UTTERANCE_DURATION_MS) {
+        clearSpeakerFinalizeTimer(speakerState);
+        voiceState.speakers.delete(speakerKey);
+        voiceState.droppedUtterances += 1;
+        voiceState.lastDroppedUtteranceReason =
+          nextByteLength > VOICE_MAX_UTTERANCE_BYTES ? "utterance-byte-limit" : "utterance-duration-limit";
+        logger.warn?.(`[teamspeak voice] dropped utterance from ${speakerKey}: ${voiceState.lastDroppedUtteranceReason}`);
+        return;
+      }
+      speakerState.chunks.push(Buffer.from(frame.payload));
+      speakerState.byteLength = nextByteLength;
+      speakerState.lastChunkAt = Date.now();
     }
     speakerState.sampleRate = parsed.sampleRate || speakerState.sampleRate;
     speakerState.channels = parsed.channels || speakerState.channels;
@@ -2708,6 +3390,7 @@ async function connectTeamspeakVoiceManager(cfg, logger) {
     const socket = net.createConnection(sharedState.voice.mediaSocketPath);
     let socketConnected = false;
     let socketErrorMessage = "";
+    let receiveBuffer = Buffer.alloc(0);
     sharedState.voice.socket = socket;
     sharedState.voice.buffer = Buffer.alloc(0);
     socket.on("connect", () => {
@@ -2725,25 +3408,21 @@ async function connectTeamspeakVoiceManager(cfg, logger) {
       }
     });
     socket.on("data", (chunk) => {
-      sharedState.voice.buffer = Buffer.concat([sharedState.voice.buffer, chunk]);
-      while (true) {
-        const newlineIndex = sharedState.voice.buffer.indexOf(0x0a);
-        if (newlineIndex < 0) {
-          return;
+      if (sharedState.voice.socket !== socket) {
+        return;
+      }
+      try {
+        const parsed = parseVoiceMediaSocketChunk(receiveBuffer, chunk);
+        receiveBuffer = parsed.buffer;
+        sharedState.voice.buffer = receiveBuffer;
+        for (const parsedFrame of parsed.frames) {
+          handleVoiceMediaFrame(cfg, { ...parsedFrame, socket }, logger);
         }
-        const header = sharedState.voice.buffer.subarray(0, newlineIndex).toString("utf8");
-        const fields = header.split("\t");
-        const needsPayload = fields[1] === "audio.chunk";
-        const payloadBytes = needsPayload ? Number.parseInt(fields[11] || "", 10) || 0 : 0;
-        const totalBytes = newlineIndex + 1 + payloadBytes;
-        if (sharedState.voice.buffer.length < totalBytes) {
-          return;
-        }
-        const payload = needsPayload
-          ? sharedState.voice.buffer.subarray(newlineIndex + 1, newlineIndex + 1 + payloadBytes)
-          : Buffer.alloc(0);
-        sharedState.voice.buffer = sharedState.voice.buffer.subarray(totalBytes);
-        handleVoiceMediaFrame(cfg, { fields, payload, socket }, logger);
+      } catch (error) {
+        socketErrorMessage = String(error);
+        sharedState.voice.lastError = socketErrorMessage;
+        logger.warn?.(`[teamspeak voice] media protocol violation: ${socketErrorMessage}`);
+        socket.destroy(error);
       }
     });
     socket.on("error", (error) => {
@@ -2762,6 +3441,7 @@ async function connectTeamspeakVoiceManager(cfg, logger) {
       sharedState.voice.connected = false;
       sharedState.voice.connecting = false;
       sharedState.voice.socket = null;
+      receiveBuffer = Buffer.alloc(0);
       sharedState.voice.buffer = Buffer.alloc(0);
       if (wasConnected) {
         logger.warn?.("[teamspeak voice] media socket disconnected");
@@ -2810,12 +3490,13 @@ async function stopTeamspeakVoiceManager(logger) {
   logger.info?.("[teamspeak voice] stopped voice manager");
 }
 
-async function handleInboundTeamspeakEvent(cfg, normalized, logger) {
+async function handleInboundTeamspeakEvent(cfg, normalized, logger, options = {}) {
   const account = resolveTeamspeakChannelConfig(cfg);
   return await dispatchTeamspeakTurn({
     cfg,
     normalized,
     logger,
+    fingerprintClaimed: options.fingerprintClaimed === true,
     deliverReply: async (payload, context) => {
       const replyText = extractReplyText(payload).trim();
       if (!replyText) {
@@ -2824,6 +3505,123 @@ async function handleInboundTeamspeakEvent(cfg, normalized, logger) {
       await sendTeamspeakText(account, context.originatingTo, replyText);
     }
   });
+}
+
+function retryQueuedTeamspeakEvent(entry) {
+  const fingerprint = entry.normalized.fingerprint;
+  if (!claimInboundFingerprint(fingerprint, "queued")) {
+    return;
+  }
+  sharedState.ingressQueue.push(entry);
+  pumpTeamspeakIngressQueue();
+}
+
+async function dispatchQueuedTeamspeakEvent(entry) {
+  try {
+    entry.attempts += 1;
+    await handleInboundTeamspeakEvent(entry.cfg, entry.normalized, entry.logger, {
+      fingerprintClaimed: true
+    });
+  } catch (error) {
+    entry.logger.error?.(
+      `[teamspeak] queued inbound dispatch failed (attempt ${entry.attempts}/${INGRESS_DISPATCH_MAX_ATTEMPTS}): ${String(error)}`
+    );
+    if (entry.attempts < INGRESS_DISPATCH_MAX_ATTEMPTS && !sharedState.stopping) {
+      setTimeout(() => {
+        retryQueuedTeamspeakEvent(entry);
+      }, INGRESS_RETRY_DELAY_MS).unref?.();
+    }
+  } finally {
+    sharedState.ingressActiveDispatches = Math.max(0, sharedState.ingressActiveDispatches - 1);
+    pumpTeamspeakIngressQueue();
+  }
+}
+
+function pumpTeamspeakIngressQueue() {
+  while (
+    sharedState.ingressActiveDispatches < INGRESS_MAX_ACTIVE_DISPATCHES &&
+    sharedState.ingressQueue.length > 0
+  ) {
+    const entry = sharedState.ingressQueue.shift();
+    sharedState.ingressActiveDispatches += 1;
+    dispatchQueuedTeamspeakEvent(entry);
+  }
+}
+
+function enqueueInboundTeamspeakEvent(cfg, normalized, logger) {
+  if (!claimInboundFingerprint(normalized.fingerprint, "queued")) {
+    return {
+      accepted: true,
+      deduped: true
+    };
+  }
+  if (sharedState.ingressQueue.length >= INGRESS_MAX_QUEUE_DEPTH) {
+    releaseInboundFingerprint(normalized.fingerprint);
+    return {
+      accepted: false,
+      saturated: true
+    };
+  }
+  sharedState.ingressQueue.push({
+    cfg,
+    normalized,
+    logger,
+    attempts: 0
+  });
+  pumpTeamspeakIngressQueue();
+  return {
+    accepted: true,
+    queued: true
+  };
+}
+
+const TEAMSPEAK_CONFIG_ALLOWED_KEYS = new Set([
+  "enabled",
+  "cliPath",
+  "profile",
+  "server",
+  "nickname",
+  "identity",
+  "configPath",
+  "defaultTo",
+  "ingressPath",
+  "daemonPollMs",
+  "sessionDefaults",
+  "commandAuthorization",
+  "voice"
+]);
+const TEAMSPEAK_SESSION_DEFAULTS_ALLOWED_KEYS = new Set([
+  "model",
+  "fastMode",
+  "thinkingLevel"
+]);
+const TEAMSPEAK_COMMAND_AUTHORIZATION_ALLOWED_KEYS = new Set([
+  "mode",
+  "allowedHandlers",
+  "allowedChannels",
+  "allowedUsers"
+]);
+const TEAMSPEAK_VOICE_ALLOWED_KEYS = new Set([
+  "enabled",
+  "mode",
+  "silenceTimeoutMs",
+  "interruptOnSpeech",
+  "interruptMode",
+  "stripWakeWord",
+  "allowedHandlers",
+  "allowedChannels",
+  "allowedUsers",
+  "mediaSocketPath",
+  "mirrorTextReplies",
+  "transcriptionLanguage"
+]);
+
+function pushUnknownConfigKeyErrors(errors, value, allowedKeys, pathPrefix) {
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) {
+      errors.push(`${pathPrefix}.${key} is not allowed`);
+    }
+  }
 }
 
 function validateTeamspeakConfig(value) {
@@ -2840,6 +3638,7 @@ function validateTeamspeakConfig(value) {
     };
   }
   const errors = [];
+  pushUnknownConfigKeyErrors(errors, value, TEAMSPEAK_CONFIG_ALLOWED_KEYS, "channels.teamspeak");
   const stringKeys = ["cliPath", "profile", "server", "nickname", "identity", "configPath", "defaultTo", "ingressPath"];
   for (const key of stringKeys) {
     if (value[key] !== undefined && typeof value[key] !== "string") {
@@ -2860,6 +3659,12 @@ function validateTeamspeakConfig(value) {
       errors.push("channels.teamspeak.sessionDefaults must be an object");
     } else {
       const sessionDefaults = value.sessionDefaults;
+      pushUnknownConfigKeyErrors(
+        errors,
+        sessionDefaults,
+        TEAMSPEAK_SESSION_DEFAULTS_ALLOWED_KEYS,
+        "channels.teamspeak.sessionDefaults"
+      );
       if (sessionDefaults.model !== undefined && typeof sessionDefaults.model !== "string") {
         errors.push("channels.teamspeak.sessionDefaults.model must be a string");
       }
@@ -2871,11 +3676,46 @@ function validateTeamspeakConfig(value) {
       }
     }
   }
+  if (value.commandAuthorization !== undefined) {
+    if (!isRecord(value.commandAuthorization)) {
+      errors.push("channels.teamspeak.commandAuthorization must be an object");
+    } else {
+      const commandAuthorization = value.commandAuthorization;
+      pushUnknownConfigKeyErrors(
+        errors,
+        commandAuthorization,
+        TEAMSPEAK_COMMAND_AUTHORIZATION_ALLOWED_KEYS,
+        "channels.teamspeak.commandAuthorization"
+      );
+      if (
+        commandAuthorization.mode !== undefined &&
+        typeof commandAuthorization.mode !== "string"
+      ) {
+        errors.push("channels.teamspeak.commandAuthorization.mode must be a string");
+      } else if (
+        commandAuthorization.mode !== undefined &&
+        !["none", "allowlist", "all"].includes(commandAuthorization.mode)
+      ) {
+        errors.push("channels.teamspeak.commandAuthorization.mode must be one of none, allowlist, all");
+      }
+      const commandAuthorizationArrayKeys = ["allowedHandlers", "allowedChannels", "allowedUsers"];
+      for (const key of commandAuthorizationArrayKeys) {
+        if (
+          commandAuthorization[key] !== undefined &&
+          (!Array.isArray(commandAuthorization[key]) ||
+            commandAuthorization[key].some((entry) => typeof entry !== "string"))
+        ) {
+          errors.push(`channels.teamspeak.commandAuthorization.${key} must be an array of strings`);
+        }
+      }
+    }
+  }
   if (value.voice !== undefined) {
     if (!isRecord(value.voice)) {
       errors.push("channels.teamspeak.voice must be an object");
     } else {
       const voice = value.voice;
+      pushUnknownConfigKeyErrors(errors, voice, TEAMSPEAK_VOICE_ALLOWED_KEYS, "channels.teamspeak.voice");
       const voiceBooleanKeys = ["enabled", "interruptOnSpeech", "stripWakeWord", "mirrorTextReplies"];
       for (const key of voiceBooleanKeys) {
         if (voice[key] !== undefined && typeof voice[key] !== "boolean") {
@@ -2908,6 +3748,14 @@ function validateTeamspeakConfig(value) {
         !["always_on", "wake_word", "push_to_talk", "wake_or_ptt"].includes(voice.mode)
       ) {
         errors.push("channels.teamspeak.voice.mode must be one of always_on, wake_word, push_to_talk, wake_or_ptt");
+      }
+      if (voice.interruptMode !== undefined && typeof voice.interruptMode !== "string") {
+        errors.push("channels.teamspeak.voice.interruptMode must be a string");
+      } else if (
+        voice.interruptMode !== undefined &&
+        !["any_speech", "wake_word"].includes(voice.interruptMode)
+      ) {
+        errors.push("channels.teamspeak.voice.interruptMode must be one of any_speech, wake_word");
       }
     }
   }
@@ -2947,6 +3795,28 @@ const teamspeakConfigSchema = {
           thinkingLevel: { type: "string" }
         }
       },
+      commandAuthorization: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["none", "allowlist", "all"]
+          },
+          allowedHandlers: {
+            type: "array",
+            items: { type: "string" }
+          },
+          allowedChannels: {
+            type: "array",
+            items: { type: "string" }
+          },
+          allowedUsers: {
+            type: "array",
+            items: { type: "string" }
+          }
+        }
+      },
       voice: {
         type: "object",
         additionalProperties: false,
@@ -2958,6 +3828,10 @@ const teamspeakConfigSchema = {
           },
           silenceTimeoutMs: { type: "integer", minimum: 1 },
           interruptOnSpeech: { type: "boolean" },
+          interruptMode: {
+            type: "string",
+            enum: ["any_speech", "wake_word"]
+          },
           stripWakeWord: { type: "boolean" },
           allowedHandlers: {
             type: "array",
@@ -2987,7 +3861,7 @@ const teamspeakPlugin = createChatChannelPlugin({
       id: CHANNEL_ID,
       label: "TeamSpeak",
       selectionLabel: "TeamSpeak",
-      docsPath: "/docs/teamspeak-bridge-design.md",
+      docsPath: "/docs/configuration.md",
       blurb: "Bridge TeamSpeak chat through the local ts daemon and TeamSpeak client plugin."
     },
     capabilities: {
@@ -3045,10 +3919,22 @@ export const __testInternals = {
     DEFAULT_ACCOUNT_ID,
     DEFAULT_DAEMON_POLL_MS,
     DEFAULT_INGRESS_PATH,
+    INGRESS_MAX_ACTIVE_DISPATCHES,
+    INGRESS_MAX_QUEUE_DEPTH,
     PLAYBACK_SAMPLE_RATE,
     PLAYBACK_CHANNELS,
     PLAYBACK_FORMAT,
     TEAMSPEAK_CHANNEL_SESSION_ID,
+    VOICE_MEDIA_PROTOCOL_VERSION,
+    VOICE_MEDIA_MAX_HEADER_BYTES,
+    VOICE_MEDIA_MAX_PAYLOAD_BYTES,
+    VOICE_MEDIA_MAX_BUFFER_BYTES,
+    VOICE_MAX_ACTIVE_SPEAKERS,
+    VOICE_MAX_UTTERANCE_BYTES,
+    VOICE_MAX_UTTERANCE_DURATION_MS,
+    VOICE_TTS_MAX_WAV_BYTES,
+    VOICE_TTS_MAX_BASE64_CHARS,
+    VOICE_TTS_MAX_AUDIO_DURATION_MS,
     TEAMSPEAK_CHANNEL_CONVERSATION_LABEL
   },
   sharedState,
@@ -3060,6 +3946,7 @@ export const __testInternals = {
   normalizeTeamspeakInterruptMode,
   normalizeTeamspeakVoiceConfig,
   normalizeTeamspeakSessionDefaults,
+  normalizeTeamspeakCommandAuthorizationConfig,
   normalizeIngressPath,
   resolveTeamspeakCliPath,
   resolveTeamspeakChannelConfig,
@@ -3070,6 +3957,10 @@ export const __testInternals = {
   deriveMediaSocketPathFromControlPath,
   getVoiceReconnectDelayMs,
   parseMediaFrameFields,
+  pcmByteDurationMs,
+  estimateBase64DecodedBytes,
+  assertTtsAudioBase64WithinLimits,
+  validateWavPcmLimits,
   parseWavPcmToFloat32,
   mixToMono,
   resampleFloat32Mono,
@@ -3077,19 +3968,27 @@ export const __testInternals = {
   convertWavToTeamspeakPlayback,
   buildWavBufferFromPcm,
   buildMediaHeader,
+  parseVoiceMediaSocketChunk,
   findWakeWordMatch,
   evaluateVoiceAcceptance,
   pcmBufferDurationMs,
   queuedPlaybackBufferMs,
   buildTeamspeakVoiceStatus,
+  buildTeamspeakVoiceDebugStatus,
   resolveConfiguredAudioTranscriptionTarget,
   shellQuote,
   resolveGatewayBaseUrl,
+  ensureTeamspeakStateDir,
+  ingressSecretFilePath,
+  ensureIngressSecret,
   routeCacheFilePath,
   loadRouteCache,
+  flushRouteCachePersist,
   updateDmRouteCache,
   updateChannelRouteCache,
   claimInboundFingerprint,
+  commitInboundFingerprint,
+  releaseInboundFingerprint,
   parseTimestamp,
   normalizeMessageKind,
   normalizeInboundPayload,
@@ -3107,9 +4006,13 @@ export const __testInternals = {
   matchesSelfIdentity,
   isUsableTeamspeakChannelId,
   isSelfInboundMessage,
+  isNicknameOnlySelfMessageMatch,
+  isTeamspeakCommandAuthorized,
   buildTeamspeakVoiceReplySystemPrompt,
   buildVoiceNormalizedEvent,
   handleVoiceMediaFrame,
+  handleInboundTeamspeakEvent,
+  enqueueInboundTeamspeakEvent,
   validateTeamspeakConfig,
   teamspeakConfigSchema
 };
@@ -3129,6 +4032,13 @@ export default defineChannelPluginEntry({
         respond(true, buildTeamspeakVoiceStatus(api.config));
       },
       { scope: "operator.read" }
+    );
+    api.registerGatewayMethod(
+      "teamspeak.voice.debugStatus",
+      ({ respond }) => {
+        respond(true, buildTeamspeakVoiceDebugStatus(api.config));
+      },
+      { scope: "operator.admin" }
     );
     api.registerGatewayMethod(
       "teamspeak.voice.reconnect",
@@ -3236,13 +4146,20 @@ export default defineChannelPluginEntry({
           return true;
         }
         try {
-          const outcome = await handleInboundTeamspeakEvent(api.config, normalized.value, api.logger);
-          sendJson(res, 200, {
+          const outcome = enqueueInboundTeamspeakEvent(api.config, normalized.value, api.logger);
+          if (!outcome.accepted) {
+            sendJson(res, 503, {
+              ok: false,
+              error: "TeamSpeak ingress queue is saturated"
+            });
+            return true;
+          }
+          sendJson(res, 202, {
             ok: true,
             ...outcome
           });
         } catch (error) {
-          api.logger.error?.(`[teamspeak] inbound dispatch failed: ${String(error)}`);
+          api.logger.error?.(`[teamspeak] inbound enqueue failed: ${String(error)}`);
           sendJson(res, 500, {
             ok: false,
             error: String(error)
@@ -3279,6 +4196,9 @@ export default defineChannelPluginEntry({
       stop: async (ctx) => {
         sharedState.stopping = true;
         await stopTeamspeakVoiceManager(ctx.logger);
+        await flushRouteCachePersist().catch((error) => {
+          ctx.logger.warn?.(`[teamspeak] failed to flush route cache: ${String(error)}`);
+        });
         if (sharedState.daemonOwned) {
           stopOwnedDaemon();
         }

@@ -40,6 +40,7 @@ teamspeak/
     ├── architecture.md
     ├── configuration.md
     ├── development.md
+    ├── live-contracts.md
     └── event-surfaces.md
 ```
 
@@ -70,6 +71,9 @@ Configure `channels.teamspeak` in `~/.openclaw/openclaw.json`:
         "model": "openai-codex/gpt-5.3-codex-spark",
         "fastMode": true,
         "thinkingLevel": "off"
+      },
+      "commandAuthorization": {
+        "mode": "none"
       },
       "voice": {
         "enabled": true,
@@ -124,6 +128,15 @@ ts events hook list --json
 openclaw gateway call teamspeak.voice.status --json
 ```
 
+Optional local contract smoke:
+
+```bash
+npm run smoke:contracts
+```
+
+This validates the local `ts` and `openclaw` JSON shapes that unit tests cannot
+prove. See `docs/live-contracts.md` for options and caveats.
+
 ## Manual verification
 
 Text path:
@@ -133,10 +146,14 @@ Text path:
 4. reply from OpenClaw
 5. confirm the reply goes back to TeamSpeak
 
+Channel chat intentionally keeps one shared OpenClaw channel session because
+the bot is one TeamSpeak client that can move between server channels. Replies
+still target the originating TeamSpeak channel id.
+
 Voice path:
 1. confirm `teamspeak.voice.status` reports `connected: true`
 2. speak a wake-word-qualified utterance
-3. confirm `lastTranscriptionMetrics` updates
+3. confirm the sanitized `lastTranscriptionMetrics` summary updates
 4. confirm the agent replies in the correct TeamSpeak session
 5. confirm spoken playback returns through the TeamSpeak client
 
@@ -146,6 +163,8 @@ Voice path:
 - broader `ts events watch` event hookup exists in principle but is not wired into OpenClaw yet
 - the media bridge is still the authoritative path for live voice activity
 - live TeamSpeak/OpenClaw behavior still needs targeted integration checks after runtime changes
+- `voice.mode: "wake_or_ptt"` currently behaves like wake-word mode because media frames do not expose PTT state
+- UID-based proactive DMs depend on a volatile live UID to client-id cache or successful live client-list lookup
 
 ## Related docs
 
@@ -153,3 +172,4 @@ Voice path:
 - `docs/configuration.md`
 - `docs/development.md`
 - `docs/event-surfaces.md`
+- `docs/live-contracts.md`

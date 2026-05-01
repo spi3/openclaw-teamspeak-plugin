@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { beforeEach } from "node:test";
 
-import { __testInternals as teamspeak } from "../index.js";
+import pluginEntry, { __testInternals as teamspeak } from "../index.js";
 
 const silentLogger = {
   debug() {},
@@ -12,6 +12,42 @@ const silentLogger = {
   warn() {},
   error() {}
 };
+
+function installTestRuntime(routeCalls = []) {
+  pluginEntry.setRuntime({
+    channel: {
+      routing: {
+        resolveAgentRoute({ peer, accountId }) {
+          routeCalls.push(peer);
+          return {
+            agentId: "agent-a",
+            accountId,
+            sessionKey: `${peer.kind}:${peer.id}`
+          };
+        }
+      },
+      session: {
+        resolveStorePath() {
+          return "";
+        },
+        readSessionUpdatedAt() {
+          return 0;
+        }
+      },
+      reply: {
+        resolveEnvelopeFormatOptions() {
+          return {};
+        },
+        formatAgentEnvelope({ body }) {
+          return body;
+        },
+        finalizeInboundContext(payload) {
+          return payload;
+        }
+      }
+    }
+  });
+}
 
 beforeEach(() => {
   teamspeak.resetSharedStateForTests();
@@ -97,7 +133,7 @@ test("outbound targets resolve channels, clients, cached DMs, and send argv", ()
   );
 });
 
-test("route cache persists direct and channel routes", () => {
+test("route cache persists direct and channel routes", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "teamspeak-route-cache-"));
   try {
     teamspeak.sharedState.routeStateDir = stateDir;
@@ -114,6 +150,8 @@ test("route cache persists direct and channel routes", () => {
       updatedAt: 200
     });
 
+    assert.equal(fs.existsSync(path.join(stateDir, "routes.json")), false);
+    await teamspeak.flushRouteCachePersist();
     const persisted = JSON.parse(fs.readFileSync(path.join(stateDir, "routes.json"), "utf8"));
     assert.deepEqual(persisted.dmByUid, [
       {
@@ -140,6 +178,250 @@ test("route cache persists direct and channel routes", () => {
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("channel routing intentionally shares one session peer across TeamSpeak channel ids", async () => {
+  const routeCalls = [];
+  installTestRuntime(routeCalls);
+  const cfg = {
+    channels: {
+      teamspeak: {
+        cliPath: "/definitely/missing/ts"
+      }
+    }
+  };
+
+  await teamspeak.handleInboundTeamspeakEvent(cfg, {
+    eventType: "message.received",
+    messageKind: "channel",
+    sender: {
+      id: "17",
+      name: "Alice",
+      uid: "uid-alice"
+    },
+    target: {
+      id: "42",
+      mode: "channel"
+    },
+    text: "hello",
+    timestamp: 1000,
+    handler: "default",
+    fingerprint: "channel-42"
+  }, silentLogger);
+  await teamspeak.handleInboundTeamspeakEvent(cfg, {
+    eventType: "message.received",
+    messageKind: "channel",
+    sender: {
+      id: "18",
+      name: "Bob",
+      uid: "uid-bob"
+    },
+    target: {
+      id: "43",
+      mode: "channel"
+    },
+    text: "hello",
+    timestamp: 1001,
+    handler: "default",
+    fingerprint: "channel-43"
+  }, silentLogger);
+
+  assert.deepEqual(routeCalls, [
+    { kind: "channel", id: teamspeak.constants.TEAMSPEAK_CHANNEL_SESSION_ID },
+    { kind: "channel", id: teamspeak.constants.TEAMSPEAK_CHANNEL_SESSION_ID }
+  ]);
+});
+
+test("TeamSpeak command authorization defaults closed and supports allowlists", () => {
+  const normalized = {
+    messageKind: "channel",
+    sender: {
+      id: "17",
+      uid: "uid-alice"
+    },
+    target: {
+      id: "42"
+    },
+    handler: "default"
+  };
+
+  assert.equal(
+    teamspeak.isTeamspeakCommandAuthorized(normalized, teamspeak.normalizeTeamspeakCommandAuthorizationConfig(undefined)),
+    false
+  );
+  assert.equal(
+    teamspeak.isTeamspeakCommandAuthorized(
+      normalized,
+      teamspeak.normalizeTeamspeakCommandAuthorizationConfig({
+        mode: "allowlist",
+        allowedUsers: ["uid:uid-alice"]
+      })
+    ),
+    true
+  );
+  assert.equal(
+    teamspeak.isTeamspeakCommandAuthorized(
+      normalized,
+      teamspeak.normalizeTeamspeakCommandAuthorizationConfig({
+        mode: "allowlist",
+        allowedChannels: ["42"]
+      })
+    ),
+    true
+  );
+  assert.equal(
+    teamspeak.isTeamspeakCommandAuthorized(
+      normalized,
+      teamspeak.normalizeTeamspeakCommandAuthorizationConfig({
+        mode: "all"
+      })
+    ),
+    true
+  );
+});
+
+test("failed inbound dispatch releases dedupe so retry can process", async () => {
+  let finalizeCalls = 0;
+  const routeCalls = [];
+  pluginEntry.setRuntime({
+    channel: {
+      routing: {
+        resolveAgentRoute({ peer, accountId }) {
+          routeCalls.push(peer);
+          return {
+            agentId: "agent-a",
+            accountId,
+            sessionKey: `${peer.kind}:${peer.id}`
+          };
+        }
+      },
+      session: {
+        resolveStorePath() {
+          return "";
+        },
+        readSessionUpdatedAt() {
+          return 0;
+        }
+      },
+      reply: {
+        resolveEnvelopeFormatOptions() {
+          return {};
+        },
+        formatAgentEnvelope({ body }) {
+          return body;
+        },
+        finalizeInboundContext(payload) {
+          finalizeCalls += 1;
+          if (finalizeCalls === 1) {
+            throw new Error("synthetic dispatch setup failure");
+          }
+          return payload;
+        }
+      }
+    }
+  });
+  const cfg = {
+    channels: {
+      teamspeak: {
+        cliPath: "/definitely/missing/ts"
+      }
+    }
+  };
+  const normalized = {
+    eventType: "message.received",
+    messageKind: "channel",
+    sender: {
+      id: "17",
+      name: "Alice",
+      uid: "uid-alice"
+    },
+    target: {
+      id: "42",
+      mode: "channel"
+    },
+    text: "retry me",
+    timestamp: 1000,
+    handler: "default",
+    fingerprint: "retry-fingerprint"
+  };
+
+  await assert.rejects(
+    teamspeak.handleInboundTeamspeakEvent(cfg, structuredClone(normalized), silentLogger),
+    /synthetic dispatch setup failure/
+  );
+  const retry = await teamspeak.handleInboundTeamspeakEvent(cfg, structuredClone(normalized), silentLogger);
+  const deduped = await teamspeak.handleInboundTeamspeakEvent(cfg, structuredClone(normalized), silentLogger);
+
+  assert.equal(retry.deduped, false);
+  assert.equal(deduped.deduped, true);
+  assert.equal(routeCalls.length, 2);
+});
+
+test("UID-only DMs are ignored before agent dispatch when no live client id resolves", async () => {
+  const routeCalls = [];
+  installTestRuntime(routeCalls);
+  const cfg = {
+    channels: {
+      teamspeak: {
+        cliPath: "/definitely/missing/ts"
+      }
+    }
+  };
+
+  const outcome = await teamspeak.handleInboundTeamspeakEvent(cfg, {
+    eventType: "message.received",
+    messageKind: "client",
+    sender: {
+      id: "",
+      name: "Alice",
+      uid: "uid-alice"
+    },
+    target: {
+      id: "99",
+      mode: "client"
+    },
+    text: "hello",
+    timestamp: 1000,
+    handler: "default",
+    fingerprint: "uid-only-dm"
+  }, silentLogger);
+
+  assert.equal(outcome.ignored, "dm-missing-reply-target");
+  assert.equal(routeCalls.length, 0);
+});
+
+test("ingress queue reports saturation before accepting more work", () => {
+  teamspeak.sharedState.ingressActiveDispatches = teamspeak.constants.INGRESS_MAX_ACTIVE_DISPATCHES;
+  teamspeak.sharedState.ingressQueue = Array.from(
+    { length: teamspeak.constants.INGRESS_MAX_QUEUE_DEPTH },
+    (_, index) => ({
+      normalized: {
+        fingerprint: `queued-${index}`
+      }
+    })
+  );
+
+  const outcome = teamspeak.enqueueInboundTeamspeakEvent({}, {
+    eventType: "message.received",
+    messageKind: "channel",
+    sender: {
+      id: "17",
+      uid: "uid-alice"
+    },
+    target: {
+      id: "42",
+      mode: "channel"
+    },
+    text: "overflow",
+    timestamp: 1000,
+    fingerprint: "overflow-fingerprint"
+  }, silentLogger);
+
+  assert.deepEqual(outcome, {
+    accepted: false,
+    saturated: true
+  });
+  assert.equal(teamspeak.claimInboundFingerprint("overflow-fingerprint"), true);
 });
 
 test("voice acceptance enforces allow lists and always-on mode", async () => {
@@ -320,6 +602,156 @@ test("media frame helpers decode fields and audio conversion keeps expected dura
   assert.equal(teamspeak.pcmBufferDurationMs(playback), 0);
 });
 
+test("media socket parser accepts split frames and rejects malformed frames", () => {
+  const payload = Buffer.from("abcd");
+  const header = teamspeak.buildMediaHeader([
+    "tsmedia1",
+    "audio.chunk",
+    "12345",
+    "handler-a",
+    "17",
+    teamspeak.hexEncode("uid:user-a"),
+    teamspeak.hexEncode("Alice"),
+    "42",
+    "48000",
+    "1",
+    "2",
+    String(payload.length)
+  ]);
+  const frame = Buffer.concat([header, payload]);
+  const first = teamspeak.parseVoiceMediaSocketChunk(Buffer.alloc(0), frame.subarray(0, 10));
+  assert.equal(first.frames.length, 0);
+  assert.ok(first.buffer.length > 0);
+  const second = teamspeak.parseVoiceMediaSocketChunk(first.buffer, frame.subarray(10));
+  assert.equal(second.buffer.length, 0);
+  assert.equal(second.frames.length, 1);
+  assert.deepEqual(second.frames[0].payload, payload);
+
+  assert.throws(
+    () => teamspeak.parseVoiceMediaSocketChunk(Buffer.alloc(0), Buffer.alloc(teamspeak.constants.VOICE_MEDIA_MAX_HEADER_BYTES + 1, "a")),
+    /header exceeds/
+  );
+  assert.throws(
+    () => teamspeak.parseVoiceMediaSocketChunk(Buffer.alloc(0), Buffer.from("tsmedia2\tstatus\n")),
+    /unsupported TeamSpeak media protocol/
+  );
+  assert.throws(
+    () => teamspeak.parseVoiceMediaSocketChunk(Buffer.alloc(0), Buffer.from("tsmedia1\taudio.chunk\t\t\t\t\t\t\t\t\t\t-1\n")),
+    /invalid audio payload length/
+  );
+  assert.throws(
+    () => teamspeak.parseVoiceMediaSocketChunk(
+      Buffer.alloc(0),
+      Buffer.from(`tsmedia1\taudio.chunk\t\t\t\t\t\t\t\t\t\t${teamspeak.constants.VOICE_MEDIA_MAX_PAYLOAD_BYTES + 1}\n`)
+    ),
+    /audio payload exceeds/
+  );
+});
+
+test("voice utterance buffering enforces active speaker and duration caps", () => {
+  const cfg = {
+    channels: {
+      teamspeak: {
+        cliPath: "/definitely/missing/ts"
+      }
+    }
+  };
+
+  for (let index = 0; index < teamspeak.constants.VOICE_MAX_ACTIVE_SPEAKERS; index += 1) {
+    teamspeak.handleVoiceMediaFrame(cfg, {
+      fields: [
+        "tsmedia1",
+        "speaker.start",
+        "12345",
+        "handler-a",
+        String(index),
+        teamspeak.hexEncode(`uid:${index}`),
+        teamspeak.hexEncode(`User ${index}`),
+        "42",
+        "48000",
+        "1",
+        "0",
+        "0"
+      ]
+    }, silentLogger);
+  }
+  teamspeak.handleVoiceMediaFrame(cfg, {
+    fields: [
+      "tsmedia1",
+      "speaker.start",
+      "12345",
+      "handler-a",
+      "overflow",
+      teamspeak.hexEncode("uid:overflow"),
+      teamspeak.hexEncode("Overflow"),
+      "42",
+      "48000",
+      "1",
+      "0",
+      "0"
+    ]
+  }, silentLogger);
+  assert.equal(teamspeak.sharedState.voice.speakers.size, teamspeak.constants.VOICE_MAX_ACTIVE_SPEAKERS);
+  assert.equal(teamspeak.sharedState.voice.lastDroppedUtteranceReason, "active-speaker-limit");
+
+  teamspeak.resetSharedStateForTests();
+  teamspeak.handleVoiceMediaFrame(cfg, {
+    fields: [
+      "tsmedia1",
+      "speaker.start",
+      "12345",
+      "handler-a",
+      "17",
+      teamspeak.hexEncode("uid:user-a"),
+      teamspeak.hexEncode("Alice"),
+      "42",
+      "1",
+      "1",
+      "0",
+      "0"
+    ]
+  }, silentLogger);
+  teamspeak.handleVoiceMediaFrame(cfg, {
+    fields: [
+      "tsmedia1",
+      "audio.chunk",
+      "12346",
+      "handler-a",
+      "17",
+      teamspeak.hexEncode("uid:user-a"),
+      teamspeak.hexEncode("Alice"),
+      "42",
+      "1",
+      "1",
+      "0",
+      "242"
+    ],
+    payload: Buffer.alloc(242)
+  }, silentLogger);
+  assert.equal(teamspeak.sharedState.voice.speakers.size, 0);
+  assert.equal(teamspeak.sharedState.voice.lastDroppedUtteranceReason, "utterance-duration-limit");
+});
+
+test("TTS and WAV conversion caps reject oversized audio before large allocations", () => {
+  assert.throws(
+    () => teamspeak.assertTtsAudioBase64WithinLimits("a".repeat(teamspeak.constants.VOICE_TTS_MAX_BASE64_CHARS + 1)),
+    /decoded limit/
+  );
+  const tooManyChannels = teamspeak.buildWavBufferFromPcm({
+    pcmBuffer: Buffer.alloc(0),
+    sampleRate: 48000,
+    channels: 9
+  });
+  assert.throws(
+    () => teamspeak.parseWavPcmToFloat32(tooManyChannels),
+    /channel count exceeds/
+  );
+  assert.throws(
+    () => teamspeak.resampleFloat32Mono(new Float32Array(121), 1, teamspeak.constants.PLAYBACK_SAMPLE_RATE),
+    /duration limit/
+  );
+});
+
 test("media frame handling updates playback diagnostics and error counters", () => {
   const cfg = {
     channels: {
@@ -415,62 +847,102 @@ test("voice diagnostics expose current shared state without mutating it", () => 
   teamspeak.sharedState.voice.activeSpeakerCount = 2;
   teamspeak.sharedState.voice.droppedIngressChunks = 3;
   teamspeak.sharedState.voice.droppedPlaybackChunks = 4;
+  teamspeak.sharedState.voice.droppedUtterances = 1;
+  teamspeak.sharedState.voice.lastDroppedUtteranceReason = "utterance-duration-limit";
   teamspeak.sharedState.voice.wakeTriggers = ["hey claw"];
-  teamspeak.sharedState.voice.lastError = "playback_error";
-  teamspeak.sharedState.voice.lastPlaybackMetrics = { source: "reply" };
-  teamspeak.sharedState.voice.lastTranscriptionMetrics = { outcome: "accepted" };
-  teamspeak.sharedState.voice.lastPromptGuidance = { eventType: "voice.utterance" };
+  teamspeak.sharedState.voice.lastError = "playback_error: /tmp/private-detail";
+  teamspeak.sharedState.voice.lastPlaybackMetrics = { source: "reply", error: "/tmp/private-playback" };
+  teamspeak.sharedState.voice.lastTranscriptionMetrics = {
+    outcome: "accepted",
+    baseUrl: "https://private-stt.example.test",
+    speaker: "Alice",
+    speakerKey: "handler-a:17",
+    wakeTrigger: "hey claw",
+    error: "/tmp/private-stt-error"
+  };
+  teamspeak.sharedState.voice.lastPromptGuidance = { eventType: "voice.utterance", prompt: "private prompt" };
+  teamspeak.sharedState.voice.startupError = "/tmp/private-startup";
 
-  assert.deepEqual(
-    teamspeak.buildTeamspeakVoiceStatus({
-      channels: {
-        teamspeak: {
-          cliPath: "/definitely/missing/ts",
-          sessionDefaults: {
-            model: "gpt-test"
-          },
-          voice: {
-            enabled: true
-          }
+  const status = teamspeak.buildTeamspeakVoiceStatus({
+    channels: {
+      teamspeak: {
+        cliPath: "/definitely/missing/ts",
+        sessionDefaults: {
+          model: "gpt-test"
+        },
+        voice: {
+          enabled: true
         }
       }
-    }),
-    {
-      enabled: true,
-      sessionDefaults: {
-        model: "gpt-test",
-        fastMode: null,
-        thinkingLevel: "",
-        raw: {
-          model: "gpt-test"
-        }
-      },
-      connected: true,
-      connecting: false,
-      voiceStartPending: false,
-      reconnectAttempt: undefined,
-      nextReconnectDelayMs: undefined,
-      suppressedConnectionFailures: undefined,
-      mediaSocketPath: "/tmp/ts-media.sock",
-      mediaFormat: "pcm_s16le_48000_1",
-      mediaTransport: "unix-stream/frame-v1",
-      playbackActive: true,
-      queuedPlaybackSamples: 4800,
-      queuedPlaybackBufferMs: 100,
-      activeSpeakerCount: 2,
-      droppedIngressChunks: 3,
-      droppedPlaybackChunks: 4,
-      wakeTriggers: ["hey claw"],
-      wakeFetchedAt: undefined,
-      lastHelloAt: undefined,
-      lastStatusAt: undefined,
-      lastError: "playback_error",
-      lastPlaybackMetrics: { source: "reply" },
-      lastTranscriptionMetrics: { outcome: "accepted" },
-      lastPromptGuidance: { eventType: "voice.utterance" },
-      startupError: undefined
     }
-  );
+  });
+
+  assert.deepEqual(status, {
+    enabled: true,
+    sessionDefaults: {
+      model: "gpt-test",
+      fastMode: null,
+      thinkingLevel: ""
+    },
+    connected: true,
+    connecting: false,
+    voiceStartPending: false,
+    reconnectAttempt: undefined,
+    nextReconnectDelayMs: undefined,
+    suppressedConnectionFailures: undefined,
+    mediaSocketConfigured: true,
+    mediaFormat: "pcm_s16le_48000_1",
+    mediaTransport: "unix-stream/frame-v1",
+    playbackActive: true,
+    queuedPlaybackSamples: 4800,
+    queuedPlaybackBufferMs: 100,
+    activeSpeakerCount: 2,
+    droppedIngressChunks: 3,
+    droppedPlaybackChunks: 4,
+    droppedUtterances: 1,
+    lastDroppedUtteranceReason: "utterance-duration-limit",
+    wakeTriggerCount: 1,
+    wakeFetchedAt: undefined,
+    lastHelloAt: undefined,
+    lastStatusAt: undefined,
+    lastErrorPresent: true,
+    lastErrorCode: "playback_error",
+    lastPlaybackMetrics: {
+      source: "reply",
+      updatedAt: undefined,
+      replyChars: undefined,
+      ttsMs: undefined,
+      wavBytes: undefined,
+      audioDurationMs: undefined,
+      chunkCount: undefined,
+      queuePeakMs: undefined,
+      errorPresent: true
+    },
+    lastTranscriptionMetrics: {
+      source: undefined,
+      updatedAt: undefined,
+      finalizeReason: undefined,
+      audioDurationMs: undefined,
+      transcriptionDurationMs: undefined,
+      transcriptLength: undefined,
+      normalizedTranscriptLength: undefined,
+      outcome: "accepted",
+      accepted: undefined,
+      acceptedReason: undefined,
+      wakeMatched: undefined,
+      provider: undefined,
+      model: undefined,
+      language: undefined,
+      errorPresent: true
+    },
+    startupErrorPresent: true
+  });
+  const serialized = JSON.stringify(status);
+  assert.equal(serialized.includes("/tmp/ts-media.sock"), false);
+  assert.equal(serialized.includes("hey claw"), false);
+  assert.equal(serialized.includes("private-stt"), false);
+  assert.equal(serialized.includes("handler-a:17"), false);
+  assert.equal(serialized.includes("private prompt"), false);
 });
 
 test("transcription target resolution reports provider, request, and display hint", () => {
@@ -519,6 +991,23 @@ test("self identity matching prefers uid and client id before nickname-only fall
   assert.equal(teamspeak.matchesSelfIdentity({ clientId: "7" }, selfIdentity), true);
   assert.equal(teamspeak.matchesSelfIdentity({ nickname: "Claw" }, selfIdentity), true);
   assert.equal(teamspeak.matchesSelfIdentity({ uid: "uid:other", nickname: "Claw" }, selfIdentity), false);
+  assert.equal(
+    teamspeak.isNicknameOnlySelfMessageMatch({
+      sender: {
+        name: "Claw"
+      }
+    }, selfIdentity),
+    true
+  );
+  assert.equal(
+    teamspeak.isNicknameOnlySelfMessageMatch({
+      sender: {
+        uid: "uid:other",
+        name: "Claw"
+      }
+    }, selfIdentity),
+    false
+  );
   assert.equal(teamspeak.isUsableTeamspeakChannelId("42"), true);
   assert.equal(teamspeak.isUsableTeamspeakChannelId("0"), false);
   assert.equal(teamspeak.buildTeamspeakVoiceReplySystemPrompt({ eventType: "voice.utterance" }).includes("spoken aloud"), true);

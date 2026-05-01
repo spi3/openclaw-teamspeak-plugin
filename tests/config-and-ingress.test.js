@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test, { beforeEach } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import pluginEntry, { __testInternals as teamspeak } from "../index.js";
+
+const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 beforeEach(() => {
   teamspeak.resetSharedStateForTests();
@@ -12,6 +18,12 @@ test("plugin entry keeps TeamSpeak metadata and config schema available", () => 
   assert.equal(pluginEntry.name, "TeamSpeak");
   assert.equal(pluginEntry.configSchema, teamspeak.teamspeakConfigSchema);
   assert.equal(pluginEntry.plugin.base.id, "teamspeak");
+  assert.equal(pluginEntry.plugin.base.meta.docsPath, "/docs/configuration.md");
+  assert.equal(fs.existsSync(path.join(REPO_DIR, pluginEntry.plugin.base.meta.docsPath.slice(1))), true);
+  assert.deepEqual(teamspeak.teamspeakConfigSchema.jsonSchema.properties.voice.properties.interruptMode, {
+    type: "string",
+    enum: ["any_speech", "wake_word"]
+  });
   assert.deepEqual(pluginEntry.plugin.base.capabilities.chatTypes, ["direct", "channel"]);
 });
 
@@ -33,6 +45,12 @@ test("channel config normalization applies defaults, trimming, and voice policy"
           model: " gpt-test ",
           fastMode: true,
           thinkingLevel: "HIGH"
+        },
+        commandAuthorization: {
+          mode: "allowlist",
+          allowedHandlers: [" handler-a "],
+          allowedChannels: [" 42 "],
+          allowedUsers: [" uid:user-a "]
         },
         voice: {
           enabled: true,
@@ -72,6 +90,18 @@ test("channel config normalization applies defaults, trimming, and voice policy"
       model: " gpt-test ",
       fastMode: true,
       thinkingLevel: "HIGH"
+    }
+  });
+  assert.deepEqual(account.commandAuthorization, {
+    mode: "allowlist",
+    allowedHandlers: ["handler-a"],
+    allowedChannels: ["42"],
+    allowedUsers: ["uid:user-a"],
+    raw: {
+      mode: "allowlist",
+      allowedHandlers: [" handler-a "],
+      allowedChannels: [" 42 "],
+      allowedUsers: [" uid:user-a "]
     }
   });
   assert.equal(account.voice.enabled, true);
@@ -133,11 +163,18 @@ test("config schema validation accepts valid settings and reports precise invali
         fastMode: false,
         thinkingLevel: "low"
       },
+      commandAuthorization: {
+        mode: "allowlist",
+        allowedHandlers: ["default"],
+        allowedChannels: ["42"],
+        allowedUsers: ["uid:user-a"]
+      },
       voice: {
         enabled: true,
         mode: "wake_word",
         silenceTimeoutMs: 1000,
         interruptOnSpeech: true,
+        interruptMode: "any_speech",
         stripWakeWord: true,
         allowedHandlers: ["default"],
         allowedChannels: ["42"],
@@ -157,11 +194,18 @@ test("config schema validation accepts valid settings and reports precise invali
           fastMode: false,
           thinkingLevel: "low"
         },
+        commandAuthorization: {
+          mode: "allowlist",
+          allowedHandlers: ["default"],
+          allowedChannels: ["42"],
+          allowedUsers: ["uid:user-a"]
+        },
         voice: {
           enabled: true,
           mode: "wake_word",
           silenceTimeoutMs: 1000,
           interruptOnSpeech: true,
+          interruptMode: "any_speech",
           stripWakeWord: true,
           allowedHandlers: ["default"],
           allowedChannels: ["42"],
@@ -182,6 +226,10 @@ test("config schema validation accepts valid settings and reports precise invali
       fastMode: "yes",
       thinkingLevel: false
     },
+    commandAuthorization: {
+      mode: "everybody",
+      allowedUsers: ["uid:user-a", 7]
+    },
     voice: {
       enabled: "yes",
       mode: "invalid",
@@ -198,11 +246,62 @@ test("config schema validation accepts valid settings and reports precise invali
     "channels.teamspeak.sessionDefaults.model must be a string",
     "channels.teamspeak.sessionDefaults.fastMode must be a boolean",
     "channels.teamspeak.sessionDefaults.thinkingLevel must be a string",
+    "channels.teamspeak.commandAuthorization.mode must be one of none, allowlist, all",
+    "channels.teamspeak.commandAuthorization.allowedUsers must be an array of strings",
     "channels.teamspeak.voice.enabled must be a boolean",
     "channels.teamspeak.voice.interruptOnSpeech must be a boolean",
     "channels.teamspeak.voice.allowedUsers must be an array of strings",
     "channels.teamspeak.voice.silenceTimeoutMs must be a positive integer",
     "channels.teamspeak.voice.mode must be one of always_on, wake_word, push_to_talk, wake_or_ptt"
+  ]);
+});
+
+test("config schema validation rejects invalid interruptMode type and enum", () => {
+  assert.deepEqual(
+    teamspeak.validateTeamspeakConfig({
+      voice: {
+        interruptMode: false
+      }
+    }),
+    {
+      ok: false,
+      errors: ["channels.teamspeak.voice.interruptMode must be a string"]
+    }
+  );
+
+  assert.deepEqual(
+    teamspeak.validateTeamspeakConfig({
+      voice: {
+        interruptMode: "invalid"
+      }
+    }),
+    {
+      ok: false,
+      errors: ["channels.teamspeak.voice.interruptMode must be one of any_speech, wake_word"]
+    }
+  );
+});
+
+test("config schema validation rejects unknown keys where additionalProperties is false", () => {
+  const invalid = teamspeak.validateTeamspeakConfig({
+    unknownTopLevel: true,
+    sessionDefaults: {
+      unknownSessionDefault: true
+    },
+    commandAuthorization: {
+      unknownCommandAuthorization: true
+    },
+    voice: {
+      unknownVoice: true
+    }
+  });
+
+  assert.equal(invalid.ok, false);
+  assert.deepEqual(invalid.errors, [
+    "channels.teamspeak.unknownTopLevel is not allowed",
+    "channels.teamspeak.sessionDefaults.unknownSessionDefault is not allowed",
+    "channels.teamspeak.commandAuthorization.unknownCommandAuthorization is not allowed",
+    "channels.teamspeak.voice.unknownVoice is not allowed"
   ]);
 });
 
@@ -302,8 +401,9 @@ test("dedupe claims each inbound fingerprint once until state is reset", () => {
   assert.equal(teamspeak.claimInboundFingerprint("fingerprint-a"), true);
 });
 
-test("hook command construction quotes URLs, secrets, and hook records consistently", () => {
-  teamspeak.sharedState.ingressSecret = "sec'ret";
+test("hook command construction quotes URLs, secret files, and hook records consistently", () => {
+  teamspeak.sharedState.ingressSecret = "super-hidden-secret";
+  teamspeak.sharedState.routeStateDir = "/tmp/team speak'state";
   const command = teamspeak.buildHookExecCommand({
     gateway: {
       port: 19999
@@ -315,7 +415,11 @@ test("hook command construction quotes URLs, secrets, and hook records consisten
     }
   });
 
-  assert.match(command, /^'.+' '.+hook-relay\.js' --url 'http:\/\/127\.0\.0\.1:19999\/teamspeak\/hook' --secret 'sec'"'"'ret'$/);
+  assert.match(
+    command,
+    /^'.+' '.+hook-relay\.js' --url 'http:\/\/127\.0\.0\.1:19999\/teamspeak\/hook' --secret-file '\/tmp\/team speak'"'"'state\/ingress-secret\.txt'$/
+  );
+  assert.equal(command.includes("super-hidden-secret"), false);
   assert.deepEqual(
     teamspeak.normalizeHookRecord({
       hook_id: "hook-1",
@@ -331,4 +435,42 @@ test("hook command construction quotes URLs, secrets, and hook records consisten
     }
   );
   assert.equal(teamspeak.normalizeHookRecord({ id: "missing-type" }), null);
+});
+
+test("ingress secret helper creates private state and secret files", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "teamspeak-secret-"));
+  const stateDir = path.join(root, "teamspeak");
+  try {
+    fs.mkdirSync(stateDir, { mode: 0o755 });
+    fs.chmodSync(stateDir, 0o755);
+    const secret = teamspeak.ensureIngressSecret(stateDir);
+    const secretPath = teamspeak.ingressSecretFilePath(stateDir);
+
+    assert.match(secret, /^[0-9a-f]{48}$/);
+    assert.equal(fs.statSync(stateDir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(secretPath).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(secretPath, "utf8").trim(), secret);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ingress secret helper repairs and rotates exposed existing secret files", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "teamspeak-secret-"));
+  const stateDir = path.join(root, "teamspeak");
+  try {
+    fs.mkdirSync(stateDir, { mode: 0o700 });
+    const secretPath = teamspeak.ingressSecretFilePath(stateDir);
+    fs.writeFileSync(secretPath, "leaked-secret\n", { mode: 0o644 });
+    fs.chmodSync(secretPath, 0o644);
+
+    const secret = teamspeak.ensureIngressSecret(stateDir);
+
+    assert.notEqual(secret, "leaked-secret");
+    assert.match(secret, /^[0-9a-f]{48}$/);
+    assert.equal(fs.statSync(secretPath).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(secretPath, "utf8").trim(), secret);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
