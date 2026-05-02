@@ -36,13 +36,14 @@ Declares:
 
 There are two distinct inbound surfaces.
 
-### 1. Text events (`ts daemon`)
+### 1. Daemon events (`ts daemon`)
 
 Current use:
 - `message.received` for `client`
 - `message.received` for `channel`
+- `client.moved` as an informational movement turn in the shared channel session
 
-These arrive via:
+Daemon events arrive via:
 1. TeamSpeak client plugin callback
 2. `teamspeak-cli` daemon event polling
 3. daemon hook execution

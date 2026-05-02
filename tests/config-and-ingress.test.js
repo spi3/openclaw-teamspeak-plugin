@@ -378,13 +378,59 @@ test("inbound payload normalization handles client, channel, env fallback, and i
   assert.equal(normalizedChannel.value.text, "channel text");
   assert.equal(normalizedChannel.value.timestamp, 1234);
 
+  const movedBody = {
+    event: {
+      type: "client.moved",
+      timestamp: "2026-02-03T04:05:07.000Z",
+      fields: {
+        handler: "default",
+        client_id: "17",
+        old_channel_id: "41",
+        new_channel_id: "42",
+        message: "follow me"
+      }
+    }
+  };
+  const normalizedMoved = teamspeak.normalizeInboundPayload(movedBody);
+  assert.equal(normalizedMoved.ok, true);
+  assert.equal(normalizedMoved.value.eventType, "client.moved");
+  assert.equal(normalizedMoved.value.messageKind, "channel");
+  assert.deepEqual(normalizedMoved.value.sender, {
+    id: "17",
+    name: "",
+    uid: ""
+  });
+  assert.deepEqual(normalizedMoved.value.target, {
+    id: "42",
+    mode: "channel"
+  });
+  assert.equal(
+    normalizedMoved.value.text,
+    "TeamSpeak client 17 moved channels. Old channel id: 41. New channel id: 42. Move message: follow me"
+  );
+  assert.deepEqual(normalizedMoved.value.movement, {
+    clientId: "17",
+    oldChannelId: "41",
+    newChannelId: "42",
+    message: "follow me"
+  });
+  assert.equal(normalizedMoved.value.timestamp, Date.parse("2026-02-03T04:05:07.000Z"));
+  assert.equal(
+    teamspeak.normalizeInboundPayload(movedBody).value.fingerprint,
+    normalizedMoved.value.fingerprint
+  );
+
   assert.deepEqual(
     teamspeak.normalizeInboundPayload({ event: { type: "message.received", fields: { message_kind: 3, text: "x" } } }),
     { ok: false, ignored: "server chat is not routed" }
   );
   assert.deepEqual(
-    teamspeak.normalizeInboundPayload({ event: { type: "client.moved" } }),
-    { ok: false, ignored: "unsupported event type client.moved" }
+    teamspeak.normalizeInboundPayload({ event: { type: "client.moved", fields: { old_channel_id: "41" } } }),
+    { ok: false, ignored: "client move event missing client id" }
+  );
+  assert.deepEqual(
+    teamspeak.normalizeInboundPayload({ event: { type: "client.moved", fields: { client_id: "17" } } }),
+    { ok: false, ignored: "client move event missing channel id" }
   );
   assert.deepEqual(
     teamspeak.normalizeInboundPayload({ event: { type: "message.received", fields: { message_kind: "client", text: "x" } } }),
@@ -434,7 +480,65 @@ test("hook command construction quotes URLs, secret files, and hook records cons
       messageKind: "channel"
     }
   );
+  assert.deepEqual(
+    teamspeak.normalizeHookRecord({
+      hook_id: "hook-moved",
+      event_type: "client.moved",
+      command_line: command
+    }),
+    {
+      id: "hook-moved",
+      type: "client.moved",
+      exec: command,
+      messageKind: ""
+    }
+  );
+  assert.deepEqual(
+    teamspeak.daemonHookDefinitions.map((definition) => teamspeak.buildHookAddArgs(definition, command)),
+    [
+      ["events", "hook", "add", "--type", "message.received", "--message-kind", "client", "--exec", command],
+      ["events", "hook", "add", "--type", "message.received", "--message-kind", "channel", "--exec", command],
+      ["events", "hook", "add", "--type", "client.moved", "--exec", command]
+    ]
+  );
+  assert.equal(
+    teamspeak.hookMatchesDefinition(
+      teamspeak.normalizeHookRecord({ event_type: "client.moved", command_line: command }),
+      teamspeak.daemonHookDefinitions[2]
+    ),
+    true
+  );
   assert.equal(teamspeak.normalizeHookRecord({ id: "missing-type" }), null);
+});
+
+test("client move notifications are informational and never command-authorized", () => {
+  const commandAuthorization = {
+    mode: "allowlist",
+    allowedChannels: ["42"],
+    allowedUsers: ["client:17"]
+  };
+  assert.equal(
+    teamspeak.resolveTeamspeakCommandAuthorized({
+      eventType: "message.received",
+      messageKind: "channel",
+      sender: { id: "17" },
+      target: { id: "42" }
+    }, commandAuthorization),
+    true
+  );
+  assert.equal(
+    teamspeak.resolveTeamspeakCommandAuthorized({
+      eventType: "client.moved",
+      messageKind: "channel",
+      sender: { id: "17" },
+      target: { id: "42" }
+    }, commandAuthorization),
+    false
+  );
+  assert.match(
+    teamspeak.buildTeamspeakEventSystemPrompt({ eventType: "client.moved" }),
+    /automatic TeamSpeak client movement notification/
+  );
 });
 
 test("ingress secret helper creates private state and secret files", () => {

@@ -232,6 +232,49 @@ test("channel routing intentionally shares one session peer across TeamSpeak cha
   ]);
 });
 
+test("client moved events route into the shared TeamSpeak channel session", async () => {
+  const routeCalls = [];
+  installTestRuntime(routeCalls);
+  const cfg = {
+    channels: {
+      teamspeak: {
+        cliPath: "/definitely/missing/ts"
+      }
+    }
+  };
+
+  const outcome = await teamspeak.handleInboundTeamspeakEvent(cfg, {
+    eventType: "client.moved",
+    messageKind: "channel",
+    sender: {
+      id: "17",
+      name: "",
+      uid: ""
+    },
+    target: {
+      id: "42",
+      mode: "channel"
+    },
+    text: "TeamSpeak client 17 moved channels. Old channel id: 41. New channel id: 42.",
+    timestamp: 1000,
+    handler: "default",
+    movement: {
+      clientId: "17",
+      oldChannelId: "41",
+      newChannelId: "42",
+      message: ""
+    },
+    fingerprint: "client-moved-17-42"
+  }, silentLogger);
+
+  assert.equal(outcome.handled, true);
+  assert.equal(outcome.sessionKey, `channel:${teamspeak.constants.TEAMSPEAK_CHANNEL_SESSION_ID}`);
+  assert.deepEqual(routeCalls, [
+    { kind: "channel", id: teamspeak.constants.TEAMSPEAK_CHANNEL_SESSION_ID }
+  ]);
+  assert.equal(teamspeak.sharedState.routeCache.channelById.get("42").sessionKey, outcome.sessionKey);
+});
+
 test("TeamSpeak command authorization defaults closed and supports allowlists", () => {
   const normalized = {
     messageKind: "channel",

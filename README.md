@@ -7,7 +7,7 @@ This project bridges the local [`ts`](https://github.com/spi3/teamspeak-cli) cli
 ## What it does
 
 - registers a `teamspeak` channel plugin
-- receives TeamSpeak text events through `ts daemon` hooks
+- receives TeamSpeak text and client-move events through `ts daemon` hooks
 - sends outbound text replies back through `ts message send`
 - consumes the TeamSpeak media socket for voice input and playback
 - transcribes finalized utterances through OpenClaw STT
@@ -22,7 +22,7 @@ This is live code and currently used in a real OpenClaw runtime.
 Current shape:
 - production code is still intentionally small and flat
 - unit tests cover the stable plugin seams; live/manual verification still covers TeamSpeak/OpenClaw integration
-- broader non-message TeamSpeak event integration is deferred until `teamspeak-cli` event docs are clearer
+- broader non-message TeamSpeak event routing is deferred until `teamspeak-cli` event docs are clearer
 
 ## Repository layout
 
@@ -159,7 +159,8 @@ Voice path:
 
 ## Known limitations
 
-- TeamSpeak text hooks currently reconcile only `message.received`
+- TeamSpeak daemon hooks currently reconcile `message.received` for text and `client.moved` movement notifications
+- `client.moved` turns are informational and are never command-authorized
 - broader `ts events watch` event hookup exists in principle but is not wired into OpenClaw yet
 - the media bridge is still the authoritative path for live voice activity
 - live TeamSpeak/OpenClaw behavior still needs targeted integration checks after runtime changes

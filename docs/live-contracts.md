@@ -60,12 +60,13 @@ TeamSpeak CLI and plugin contracts:
   already-running daemon, that external daemon must be using the same profile,
   server, config path, and hook state expected by this plugin.
 
-The script cannot synthesize a real `message.received` hook payload. Capture one
-live DM and one live channel payload after `teamspeak-cli` upgrades and confirm
-the payload still exposes `fields.message_kind` or `fields.target_mode`,
-`fields.from_id`, `fields.from_name`, `fields.from_unique_identifier`,
-`fields.to_id`, and `fields.text`. Channel events without `fields.to_id` are
-dropped because the plugin cannot route them to a TeamSpeak channel session.
+The script cannot synthesize real `message.received` or `client.moved` hook
+payloads. Capture one live DM, one live channel message, and one live client
+move after `teamspeak-cli` upgrades. Message payloads should still expose
+`fields.message_kind` or `fields.target_mode`, `fields.from_id`,
+`fields.from_name`, `fields.from_unique_identifier`, `fields.to_id`, and
+`fields.text`. Channel events without `fields.to_id` are dropped because the
+plugin cannot route them to a TeamSpeak channel session.
 
 OpenClaw contracts:
 
@@ -131,9 +132,13 @@ After runtime changes, still verify the paths the script cannot prove:
    TeamSpeak channel id.
 3. Capture real DM and channel `message.received` hook payloads and confirm the
    expected `fields.*` names are still present.
-4. Inspect `ts events hook list --json` after restart and confirm hooks are not
+4. Move a visible TeamSpeak client and confirm the `client.moved` hook payload
+   exposes `fields.client_id`, `fields.old_channel_id`, and
+   `fields.new_channel_id`, then confirm the movement appears in the shared
+   TeamSpeak channel session as an informational turn.
+5. Inspect `ts events hook list --json` after restart and confirm hooks are not
    removed/re-added repeatedly.
-5. Speak a wake-word-qualified utterance and confirm transcription, wake
+6. Speak a wake-word-qualified utterance and confirm transcription, wake
    acceptance, session routing, TTS synthesis, and playback metrics update.
-6. If using an externally started daemon, confirm its profile, server, config
+7. If using an externally started daemon, confirm its profile, server, config
    path, and hook state match `channels.teamspeak`.

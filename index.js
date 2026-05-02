@@ -74,6 +74,23 @@ const TEAMSPEAK_CHANNEL_CONVERSATION_LABEL = "TeamSpeak channel";
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_RELAY_PATH = path.join(MODULE_DIR, "hook-relay.js");
 const INGRESS_SECRET_FILE_NAME = "ingress-secret.txt";
+const DAEMON_HOOK_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    eventType: "message.received",
+    messageKind: "client",
+    label: "client"
+  }),
+  Object.freeze({
+    eventType: "message.received",
+    messageKind: "channel",
+    label: "channel"
+  }),
+  Object.freeze({
+    eventType: "client.moved",
+    messageKind: "",
+    label: "client.moved"
+  })
+]);
 
 const runtimeStore = createPluginRuntimeStore({
   pluginId: CHANNEL_ID,
@@ -1875,11 +1892,92 @@ function normalizeMessageKind(value) {
   return "";
 }
 
+function normalizeClientMovedPayload(root, fields) {
+  const clientId =
+    normalizeOptionalString(fields.client_id) ||
+    normalizeOptionalString(fields.clientId) ||
+    normalizeOptionalString(fields.clid);
+  const oldChannelId =
+    normalizeOptionalString(fields.old_channel_id) ||
+    normalizeOptionalString(fields.oldChannelId) ||
+    normalizeOptionalString(fields.old_channel);
+  const newChannelId =
+    normalizeOptionalString(fields.new_channel_id) ||
+    normalizeOptionalString(fields.newChannelId) ||
+    normalizeOptionalString(fields.channel_id) ||
+    normalizeOptionalString(fields.channelId);
+  const targetId = isUsableTeamspeakChannelId(newChannelId) ? newChannelId : oldChannelId;
+  if (!clientId) {
+    return {
+      ok: false,
+      ignored: "client move event missing client id"
+    };
+  }
+  if (!isUsableTeamspeakChannelId(targetId)) {
+    return {
+      ok: false,
+      ignored: "client move event missing channel id"
+    };
+  }
+  const moveMessage = normalizeOptionalString(fields.message);
+  const handler = normalizeOptionalString(fields.handler);
+  const timestamp = parseTimestamp(root?.timestamp);
+  const text = [
+    `TeamSpeak client ${clientId} moved channels.`,
+    oldChannelId ? `Old channel id: ${oldChannelId}.` : "",
+    newChannelId ? `New channel id: ${newChannelId}.` : "",
+    moveMessage ? `Move message: ${moveMessage}` : ""
+  ].filter(Boolean).join(" ");
+  const fingerprint = createHash("sha1")
+    .update(
+      JSON.stringify({
+        eventType: "client.moved",
+        timestamp,
+        clientId,
+        oldChannelId,
+        newChannelId,
+        moveMessage,
+        handler
+      })
+    )
+    .digest("hex");
+  return {
+    ok: true,
+    value: {
+      eventType: "client.moved",
+      messageKind: "channel",
+      sender: {
+        id: clientId,
+        name: "",
+        uid: ""
+      },
+      target: {
+        id: targetId,
+        mode: "channel"
+      },
+      text,
+      timestamp,
+      handler,
+      movement: {
+        clientId,
+        oldChannelId,
+        newChannelId,
+        message: moveMessage
+      },
+      fingerprint,
+      raw: root
+    }
+  };
+}
+
 function normalizeInboundPayload(body) {
   const root = isRecord(body?.event) ? body.event : body;
   const env = isRecord(body?.env) ? body.env : {};
   const fields = isRecord(root?.fields) ? root.fields : {};
   const eventType = normalizeOptionalString(root?.type);
+  if (eventType === "client.moved") {
+    return normalizeClientMovedPayload(root, fields);
+  }
   if (eventType !== "message.received") {
     return {
       ok: false,
@@ -2392,6 +2490,25 @@ function normalizeHookRecord(entry) {
   };
 }
 
+function hookMatchesDefinition(hook, definition) {
+  return hook.type === definition.eventType && hook.messageKind === definition.messageKind;
+}
+
+function buildHookAddArgs(definition, desiredExec) {
+  const args = [
+    "events",
+    "hook",
+    "add",
+    "--type",
+    definition.eventType
+  ];
+  if (definition.messageKind) {
+    args.push("--message-kind", definition.messageKind);
+  }
+  args.push("--exec", desiredExec);
+  return args;
+}
+
 async function reconcileHooks(cfg, logger) {
   const account = resolveTeamspeakChannelConfig(cfg);
   if (!account.enabled) {
@@ -2405,10 +2522,8 @@ async function reconcileHooks(cfg, logger) {
   const desiredExec = buildHookExecCommand(cfg);
   const rawHooks = await runTsJson(account, ["events", "hook", "list"]);
   const hooks = Array.isArray(rawHooks) ? rawHooks.map(normalizeHookRecord).filter(Boolean) : [];
-  for (const messageKind of ["client", "channel"]) {
-    const relevant = hooks.filter(
-      (hook) => hook.type === "message.received" && hook.messageKind === messageKind
-    );
+  for (const definition of DAEMON_HOOK_DEFINITIONS) {
+    const relevant = hooks.filter((hook) => hookMatchesDefinition(hook, definition));
     const exactMatches = relevant.filter((hook) => hook.exec === desiredExec);
     const stale = relevant.filter((hook) => hook.exec !== desiredExec);
     for (const hook of stale) {
@@ -2416,28 +2531,18 @@ async function reconcileHooks(cfg, logger) {
         continue;
       }
       await runTsText(account, ["events", "hook", "remove", hook.id]);
-      logger.info?.(`[teamspeak] removed stale ${messageKind} hook ${hook.id}`);
+      logger.info?.(`[teamspeak] removed stale ${definition.label} hook ${hook.id}`);
     }
     for (const duplicate of exactMatches.slice(1)) {
       if (!duplicate.id) {
         continue;
       }
       await runTsText(account, ["events", "hook", "remove", duplicate.id]);
-      logger.info?.(`[teamspeak] removed duplicate ${messageKind} hook ${duplicate.id}`);
+      logger.info?.(`[teamspeak] removed duplicate ${definition.label} hook ${duplicate.id}`);
     }
     if (exactMatches.length === 0) {
-      await runTsText(account, [
-        "events",
-        "hook",
-        "add",
-        "--type",
-        "message.received",
-        "--message-kind",
-        messageKind,
-        "--exec",
-        desiredExec
-      ]);
-      logger.info?.(`[teamspeak] installed ${messageKind} hook`);
+      await runTsText(account, buildHookAddArgs(definition, desiredExec));
+      logger.info?.(`[teamspeak] installed ${definition.label} hook`);
     }
   }
 }
@@ -2647,6 +2752,13 @@ function isTeamspeakCommandAuthorized(normalized, commandAuthorization) {
   return userCandidates.some((entry) => allowedUsers.includes(entry));
 }
 
+function resolveTeamspeakCommandAuthorized(normalized, commandAuthorization) {
+  if (normalized?.eventType === "client.moved") {
+    return false;
+  }
+  return isTeamspeakCommandAuthorized(normalized, commandAuthorization);
+}
+
 function attachDaemonLogStream(stream, logFn, prefix) {
   if (!stream || !logFn) {
     return;
@@ -2733,6 +2845,21 @@ function buildTeamspeakVoiceReplySystemPrompt(normalized) {
   ].join(" ");
 }
 
+function buildTeamspeakEventSystemPrompt(normalized) {
+  if (normalized?.eventType === "voice.utterance") {
+    return buildTeamspeakVoiceReplySystemPrompt(normalized);
+  }
+  if (normalized?.eventType === "client.moved") {
+    return [
+      "This turn is an automatic TeamSpeak client movement notification, not a user-authored chat message.",
+      "Use it to update TeamSpeak context.",
+      "Do not treat the movement notification as a command request.",
+      "Usually update context silently; send a visible reply only if the movement requires an agent response."
+    ].join(" ");
+  }
+  return undefined;
+}
+
 async function dispatchTeamspeakTurn({
   cfg,
   normalized,
@@ -2751,7 +2878,7 @@ async function dispatchTeamspeakTurn({
     const runtime = runtimeStore.getRuntime();
     const account = resolveTeamspeakChannelConfig(cfg);
     const selfIdentity = await readSelfIdentity(cfg);
-    if (isSelfInboundMessage(normalized, selfIdentity)) {
+    if (normalized.eventType === "message.received" && isSelfInboundMessage(normalized, selfIdentity)) {
       if (isNicknameOnlySelfMessageMatch(normalized, selfIdentity)) {
         logger.warn?.("[teamspeak] ignoring self-authored inbound message using nickname-only identity fallback");
       }
@@ -2798,13 +2925,13 @@ async function dispatchTeamspeakTurn({
       }
       if (isUsableTeamspeakChannelId(resolvedChannelId)) {
         logger.info?.(
-          `[teamspeak] corrected channel message target: ${normalized.target?.id || "<empty>"} -> ${resolvedChannelId}`
+          `[teamspeak] corrected channel event target: ${normalized.target?.id || "<empty>"} -> ${resolvedChannelId}`
         );
         normalized.target.id = resolvedChannelId;
       }
     }
     if (normalized.messageKind === "channel" && !isUsableTeamspeakChannelId(normalized.target?.id)) {
-      throw new Error(`channel message has unresolved TeamSpeak channel id ${normalized.target?.id || "<empty>"}`);
+      throw new Error(`channel event has unresolved TeamSpeak channel id ${normalized.target?.id || "<empty>"}`);
     }
     const sessionPeerId =
       normalized.messageKind === "client"
@@ -2854,10 +2981,16 @@ async function dispatchTeamspeakTurn({
     const untrustedContext = [
       ...(normalized.handler ? [`TeamSpeak handler: ${normalized.handler}`] : []),
       ...(normalized.messageKind === "channel" ? [`TeamSpeak current channel id: ${normalized.target.id}`] : []),
+      ...(normalized.eventType === "client.moved" ? [
+        "TeamSpeak event type: client.moved",
+        `Moved TeamSpeak client id: ${normalized.movement?.clientId || normalized.sender?.id || "<unknown>"}`,
+        `TeamSpeak old channel id: ${normalized.movement?.oldChannelId || "<unknown>"}`,
+        `TeamSpeak new channel id: ${normalized.movement?.newChannelId || "<unknown>"}`
+      ] : []),
       ...(Array.isArray(extraUntrustedContext) ? extraUntrustedContext.filter(Boolean) : [])
     ];
-    const groupSystemPrompt = buildTeamspeakVoiceReplySystemPrompt(normalized);
-    if (groupSystemPrompt) {
+    const groupSystemPrompt = buildTeamspeakEventSystemPrompt(normalized);
+    if (groupSystemPrompt && normalized.eventType === "voice.utterance") {
       sharedState.voice.lastPromptGuidance = {
         updatedAt: Date.now(),
         eventType: normalized.eventType,
@@ -2899,7 +3032,7 @@ async function dispatchTeamspeakTurn({
       Timestamp: normalized.timestamp,
       OriginatingChannel: CHANNEL_ID,
       OriginatingTo: originatingTo,
-      CommandAuthorized: isTeamspeakCommandAuthorized(normalized, account.commandAuthorization),
+      CommandAuthorized: resolveTeamspeakCommandAuthorized(normalized, account.commandAuthorization),
       UntrustedContext: untrustedContext.length > 0 ? untrustedContext : undefined
     });
     if (normalized.messageKind === "client") {
@@ -3991,6 +4124,7 @@ export const __testInternals = {
   releaseInboundFingerprint,
   parseTimestamp,
   normalizeMessageKind,
+  normalizeClientMovedPayload,
   normalizeInboundPayload,
   safeEqualText,
   parseTeamspeakTarget,
@@ -4003,12 +4137,17 @@ export const __testInternals = {
   hookUrlForConfig,
   buildHookExecCommand,
   normalizeHookRecord,
+  hookMatchesDefinition,
+  buildHookAddArgs,
+  daemonHookDefinitions: DAEMON_HOOK_DEFINITIONS,
   matchesSelfIdentity,
   isUsableTeamspeakChannelId,
   isSelfInboundMessage,
   isNicknameOnlySelfMessageMatch,
   isTeamspeakCommandAuthorized,
+  resolveTeamspeakCommandAuthorized,
   buildTeamspeakVoiceReplySystemPrompt,
+  buildTeamspeakEventSystemPrompt,
   buildVoiceNormalizedEvent,
   handleVoiceMediaFrame,
   handleInboundTeamspeakEvent,

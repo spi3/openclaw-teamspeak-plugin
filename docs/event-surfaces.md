@@ -9,6 +9,7 @@ Provided by `teamspeak-cli` through `ts events watch` and daemon hooks.
 Currently used by this plugin:
 - `message.received` (`client`)
 - `message.received` (`channel`)
+- `client.moved` (informational channel-session agent turn)
 
 Observed / confirmed in `teamspeak-cli` source for the real plugin backend:
 - `connection.requested`
@@ -50,7 +51,9 @@ Used by this plugin:
 
 ## Current policy
 
-For now, OpenClaw only reconciles daemon hooks for TeamSpeak text messages.
+For now, OpenClaw reconciles daemon hooks for TeamSpeak text messages and
+`client.moved`. Text and movement notifications are routed as OpenClaw agent
+turns; movement notifications are never command-authorized.
 
 Broader hook-based event handling should wait until `teamspeak-cli` event documentation is clearer and stable enough to build against confidently.
 
