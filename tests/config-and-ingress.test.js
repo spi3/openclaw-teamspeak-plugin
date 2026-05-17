@@ -24,6 +24,31 @@ test("plugin entry keeps TeamSpeak metadata and config schema available", () => 
     type: "string",
     enum: ["any_speech", "wake_word"]
   });
+  assert.deepEqual(teamspeak.teamspeakConfigSchema.jsonSchema.properties.channelMessages.properties.trust, {
+    type: "string",
+    enum: ["trusted", "untrusted"]
+  });
+  assert.deepEqual(teamspeak.teamspeakConfigSchema.jsonSchema.properties.directMessages.properties.trust, {
+    type: "string",
+    enum: ["trusted", "untrusted"]
+  });
+  const manifest = JSON.parse(fs.readFileSync(path.join(REPO_DIR, "openclaw.plugin.json"), "utf8"));
+  assert.deepEqual(manifest.configSchema.properties.channelMessages.properties.trust, {
+    type: "string",
+    enum: ["trusted", "untrusted"]
+  });
+  assert.deepEqual(manifest.configSchema.properties.directMessages.properties.trust, {
+    type: "string",
+    enum: ["trusted", "untrusted"]
+  });
+  assert.deepEqual(manifest.channelConfigs.teamspeak.schema.properties.channelMessages.properties.trust, {
+    type: "string",
+    enum: ["trusted", "untrusted"]
+  });
+  assert.deepEqual(manifest.channelConfigs.teamspeak.schema.properties.directMessages.properties.trust, {
+    type: "string",
+    enum: ["trusted", "untrusted"]
+  });
   assert.deepEqual(pluginEntry.plugin.base.capabilities.chatTypes, ["direct", "channel"]);
 });
 
@@ -51,6 +76,12 @@ test("channel config normalization applies defaults, trimming, and voice policy"
           allowedHandlers: [" handler-a "],
           allowedChannels: [" 42 "],
           allowedUsers: [" uid:user-a "]
+        },
+        channelMessages: {
+          trust: " UNTRUSTED "
+        },
+        directMessages: {
+          trust: " trusted "
         },
         voice: {
           enabled: true,
@@ -102,6 +133,18 @@ test("channel config normalization applies defaults, trimming, and voice policy"
       allowedHandlers: [" handler-a "],
       allowedChannels: [" 42 "],
       allowedUsers: [" uid:user-a "]
+    }
+  });
+  assert.deepEqual(account.channelMessages, {
+    trust: "untrusted",
+    raw: {
+      trust: " UNTRUSTED "
+    }
+  });
+  assert.deepEqual(account.directMessages, {
+    trust: "trusted",
+    raw: {
+      trust: " trusted "
     }
   });
   assert.equal(account.voice.enabled, true);
@@ -169,6 +212,12 @@ test("config schema validation accepts valid settings and reports precise invali
         allowedChannels: ["42"],
         allowedUsers: ["uid:user-a"]
       },
+      channelMessages: {
+        trust: "untrusted"
+      },
+      directMessages: {
+        trust: "trusted"
+      },
       voice: {
         enabled: true,
         mode: "wake_word",
@@ -200,6 +249,12 @@ test("config schema validation accepts valid settings and reports precise invali
           allowedChannels: ["42"],
           allowedUsers: ["uid:user-a"]
         },
+        channelMessages: {
+          trust: "untrusted"
+        },
+        directMessages: {
+          trust: "trusted"
+        },
         voice: {
           enabled: true,
           mode: "wake_word",
@@ -230,6 +285,12 @@ test("config schema validation accepts valid settings and reports precise invali
       mode: "everybody",
       allowedUsers: ["uid:user-a", 7]
     },
+    channelMessages: {
+      trust: false
+    },
+    directMessages: {
+      trust: false
+    },
     voice: {
       enabled: "yes",
       mode: "invalid",
@@ -248,6 +309,8 @@ test("config schema validation accepts valid settings and reports precise invali
     "channels.teamspeak.sessionDefaults.thinkingLevel must be a string",
     "channels.teamspeak.commandAuthorization.mode must be one of none, allowlist, all",
     "channels.teamspeak.commandAuthorization.allowedUsers must be an array of strings",
+    "channels.teamspeak.channelMessages.trust must be a string",
+    "channels.teamspeak.directMessages.trust must be a string",
     "channels.teamspeak.voice.enabled must be a boolean",
     "channels.teamspeak.voice.interruptOnSpeech must be a boolean",
     "channels.teamspeak.voice.allowedUsers must be an array of strings",
@@ -282,6 +345,44 @@ test("config schema validation rejects invalid interruptMode type and enum", () 
   );
 });
 
+test("config schema validation rejects invalid message trust", () => {
+  assert.deepEqual(
+    teamspeak.validateTeamspeakConfig({
+      channelMessages: {
+        trust: false
+      },
+      directMessages: {
+        trust: false
+      }
+    }),
+    {
+      ok: false,
+      errors: [
+        "channels.teamspeak.channelMessages.trust must be a string",
+        "channels.teamspeak.directMessages.trust must be a string"
+      ]
+    }
+  );
+
+  assert.deepEqual(
+    teamspeak.validateTeamspeakConfig({
+      channelMessages: {
+        trust: "sometimes"
+      },
+      directMessages: {
+        trust: "sometimes"
+      }
+    }),
+    {
+      ok: false,
+      errors: [
+        "channels.teamspeak.channelMessages.trust must be one of trusted, untrusted",
+        "channels.teamspeak.directMessages.trust must be one of trusted, untrusted"
+      ]
+    }
+  );
+});
+
 test("config schema validation rejects unknown keys where additionalProperties is false", () => {
   const invalid = teamspeak.validateTeamspeakConfig({
     unknownTopLevel: true,
@@ -290,6 +391,12 @@ test("config schema validation rejects unknown keys where additionalProperties i
     },
     commandAuthorization: {
       unknownCommandAuthorization: true
+    },
+    channelMessages: {
+      unknownChannelMessages: true
+    },
+    directMessages: {
+      unknownDirectMessages: true
     },
     voice: {
       unknownVoice: true
@@ -301,6 +408,8 @@ test("config schema validation rejects unknown keys where additionalProperties i
     "channels.teamspeak.unknownTopLevel is not allowed",
     "channels.teamspeak.sessionDefaults.unknownSessionDefault is not allowed",
     "channels.teamspeak.commandAuthorization.unknownCommandAuthorization is not allowed",
+    "channels.teamspeak.channelMessages.unknownChannelMessages is not allowed",
+    "channels.teamspeak.directMessages.unknownDirectMessages is not allowed",
     "channels.teamspeak.voice.unknownVoice is not allowed"
   ]);
 });

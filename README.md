@@ -75,6 +75,12 @@ Configure `channels.teamspeak` in `~/.openclaw/openclaw.json`:
       "commandAuthorization": {
         "mode": "none"
       },
+      "channelMessages": {
+        "trust": "trusted"
+      },
+      "directMessages": {
+        "trust": "trusted"
+      },
       "voice": {
         "enabled": true,
         "mode": "wake_word",

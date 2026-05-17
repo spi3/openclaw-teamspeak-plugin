@@ -76,6 +76,29 @@ Modes:
 - `"allowlist"` authorizes turns matching any listed handler, channel id, UID, or client id
 - `"all"` authorizes every TeamSpeak turn and should only be used on tightly controlled servers
 
+## Text message trust
+
+TeamSpeak text messages are treated as trusted by default to preserve existing behavior. Set `channelMessages.trust` or `directMessages.trust` to `"untrusted"` for shared, public, or otherwise lower-trust surfaces. Untrusted text is never `CommandAuthorized`, is forced out of owner handling, and the raw message body is attached as untrusted context for prompt assembly.
+
+```json
+{
+  "channels": {
+    "teamspeak": {
+      "channelMessages": {
+        "trust": "untrusted"
+      },
+      "directMessages": {
+        "trust": "trusted"
+      }
+    }
+  }
+}
+```
+
+Values:
+- `"trusted"` preserves normal text-message handling and still requires `commandAuthorization` before `CommandAuthorized` can be true
+- `"untrusted"` downgrades TeamSpeak text even if `commandAuthorization` would otherwise allow it
+
 ## Voice config
 
 ```json

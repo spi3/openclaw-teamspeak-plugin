@@ -14,6 +14,7 @@ import {
 import { loadSessionStore, resolveSessionStoreEntry } from "openclaw/plugin-sdk/config-runtime";
 import { dispatchInboundReplyWithBase } from "openclaw/plugin-sdk/inbound-reply-dispatch";
 import { createPluginRuntimeStore } from "openclaw/plugin-sdk/runtime-store";
+import { wrapExternalContent } from "openclaw/plugin-sdk/security-runtime";
 import { readJsonWebhookBodyOrReject } from "openclaw/plugin-sdk/webhook-ingress";
 
 const CHANNEL_ID = "teamspeak";
@@ -321,6 +322,34 @@ function normalizeTeamspeakCommandAuthorizationConfig(value) {
   };
 }
 
+function normalizeTeamspeakMessageTrust(value) {
+  const normalized = normalizeOptionalString(value).toLowerCase();
+  if (normalized === "trusted" || normalized === "untrusted") {
+    return normalized;
+  }
+  return "trusted";
+}
+
+function normalizeTeamspeakChannelMessageTrust(value) {
+  return normalizeTeamspeakMessageTrust(value);
+}
+
+function normalizeTeamspeakChannelMessagesConfig(value) {
+  const channelMessages = isRecord(value) ? value : {};
+  return {
+    trust: normalizeTeamspeakMessageTrust(channelMessages.trust),
+    raw: channelMessages
+  };
+}
+
+function normalizeTeamspeakDirectMessagesConfig(value) {
+  const directMessages = isRecord(value) ? value : {};
+  return {
+    trust: normalizeTeamspeakMessageTrust(directMessages.trust),
+    raw: directMessages
+  };
+}
+
 function normalizeIngressPath(value) {
   const trimmed = normalizeOptionalString(value);
   if (!trimmed) {
@@ -385,6 +414,8 @@ function resolveTeamspeakChannelConfig(cfg) {
     daemonPollMs: normalizePositiveInteger(channelConfig.daemonPollMs, DEFAULT_DAEMON_POLL_MS),
     sessionDefaults: normalizeTeamspeakSessionDefaults(channelConfig.sessionDefaults),
     commandAuthorization: normalizeTeamspeakCommandAuthorizationConfig(channelConfig.commandAuthorization),
+    channelMessages: normalizeTeamspeakChannelMessagesConfig(channelConfig.channelMessages),
+    directMessages: normalizeTeamspeakDirectMessagesConfig(channelConfig.directMessages),
     voice: normalizeTeamspeakVoiceConfig(channelConfig.voice),
     raw: channelConfig
   };
@@ -2759,6 +2790,67 @@ function resolveTeamspeakCommandAuthorized(normalized, commandAuthorization) {
   return isTeamspeakCommandAuthorized(normalized, commandAuthorization);
 }
 
+function isTeamspeakChannelTextMessage(normalized) {
+  return normalized?.eventType === "message.received" && normalized?.messageKind === "channel";
+}
+
+function isTeamspeakDirectTextMessage(normalized) {
+  return normalized?.eventType === "message.received" && normalized?.messageKind === "client";
+}
+
+function isTeamspeakChannelMessageTrusted(normalized, channelMessages) {
+  if (!isTeamspeakChannelTextMessage(normalized)) {
+    return true;
+  }
+  return normalizeTeamspeakMessageTrust(channelMessages?.trust) === "trusted";
+}
+
+function isTeamspeakDirectMessageTrusted(normalized, directMessages) {
+  if (!isTeamspeakDirectTextMessage(normalized)) {
+    return true;
+  }
+  return normalizeTeamspeakMessageTrust(directMessages?.trust) === "trusted";
+}
+
+function isTeamspeakMessageTrusted(normalized, account) {
+  if (isTeamspeakChannelTextMessage(normalized)) {
+    return isTeamspeakChannelMessageTrusted(normalized, account?.channelMessages);
+  }
+  if (isTeamspeakDirectTextMessage(normalized)) {
+    return isTeamspeakDirectMessageTrusted(normalized, account?.directMessages);
+  }
+  return true;
+}
+
+function resolveTeamspeakTurnCommandAuthorized(normalized, account) {
+  if (!isTeamspeakMessageTrusted(normalized, account)) {
+    return false;
+  }
+  return resolveTeamspeakCommandAuthorized(normalized, account?.commandAuthorization);
+}
+
+function buildTeamspeakUntrustedMessageContext(normalized) {
+  if (!isTeamspeakChannelTextMessage(normalized) && !isTeamspeakDirectTextMessage(normalized)) {
+    return null;
+  }
+  const body = normalizeOptionalString(normalized.text);
+  if (!body) {
+    return null;
+  }
+  const kind = isTeamspeakDirectTextMessage(normalized) ? "direct" : "channel";
+  return wrapExternalContent(`UNTRUSTED TeamSpeak ${kind} message body\n${body}`, {
+    source: "unknown",
+    includeWarning: false
+  });
+}
+
+function buildTeamspeakUntrustedChannelMessageContext(normalized) {
+  if (!isTeamspeakChannelTextMessage(normalized)) {
+    return null;
+  }
+  return buildTeamspeakUntrustedMessageContext(normalized);
+}
+
 function attachDaemonLogStream(stream, logFn, prefix) {
   if (!stream || !logFn) {
     return;
@@ -2978,9 +3070,14 @@ async function dispatchTeamspeakTurn({
       normalized.messageKind === "client"
         ? `teamspeak:dm:${normalizeOptionalString(normalized.sender.uid) || normalizeOptionalString(normalized.sender.id)}`
         : `teamspeak:channel:${normalized.target.id}`;
+    const messageTrusted = isTeamspeakMessageTrusted(normalized, account);
+    const untrustedMessageContext = messageTrusted
+      ? null
+      : buildTeamspeakUntrustedMessageContext(normalized);
     const untrustedContext = [
       ...(normalized.handler ? [`TeamSpeak handler: ${normalized.handler}`] : []),
       ...(normalized.messageKind === "channel" ? [`TeamSpeak current channel id: ${normalized.target.id}`] : []),
+      ...(untrustedMessageContext ? [untrustedMessageContext] : []),
       ...(normalized.eventType === "client.moved" ? [
         "TeamSpeak event type: client.moved",
         `Moved TeamSpeak client id: ${normalized.movement?.clientId || normalized.sender?.id || "<unknown>"}`,
@@ -3032,7 +3129,8 @@ async function dispatchTeamspeakTurn({
       Timestamp: normalized.timestamp,
       OriginatingChannel: CHANNEL_ID,
       OriginatingTo: originatingTo,
-      CommandAuthorized: resolveTeamspeakCommandAuthorized(normalized, account.commandAuthorization),
+      CommandAuthorized: resolveTeamspeakTurnCommandAuthorized(normalized, account),
+      ForceSenderIsOwnerFalse: messageTrusted ? undefined : true,
       UntrustedContext: untrustedContext.length > 0 ? untrustedContext : undefined
     });
     if (normalized.messageKind === "client") {
@@ -3721,6 +3819,8 @@ const TEAMSPEAK_CONFIG_ALLOWED_KEYS = new Set([
   "daemonPollMs",
   "sessionDefaults",
   "commandAuthorization",
+  "channelMessages",
+  "directMessages",
   "voice"
 ]);
 const TEAMSPEAK_SESSION_DEFAULTS_ALLOWED_KEYS = new Set([
@@ -3733,6 +3833,12 @@ const TEAMSPEAK_COMMAND_AUTHORIZATION_ALLOWED_KEYS = new Set([
   "allowedHandlers",
   "allowedChannels",
   "allowedUsers"
+]);
+const TEAMSPEAK_CHANNEL_MESSAGES_ALLOWED_KEYS = new Set([
+  "trust"
+]);
+const TEAMSPEAK_DIRECT_MESSAGES_ALLOWED_KEYS = new Set([
+  "trust"
 ]);
 const TEAMSPEAK_VOICE_ALLOWED_KEYS = new Set([
   "enabled",
@@ -3843,6 +3949,48 @@ function validateTeamspeakConfig(value) {
       }
     }
   }
+  if (value.channelMessages !== undefined) {
+    if (!isRecord(value.channelMessages)) {
+      errors.push("channels.teamspeak.channelMessages must be an object");
+    } else {
+      const channelMessages = value.channelMessages;
+      pushUnknownConfigKeyErrors(
+        errors,
+        channelMessages,
+        TEAMSPEAK_CHANNEL_MESSAGES_ALLOWED_KEYS,
+        "channels.teamspeak.channelMessages"
+      );
+      if (channelMessages.trust !== undefined && typeof channelMessages.trust !== "string") {
+        errors.push("channels.teamspeak.channelMessages.trust must be a string");
+      } else if (
+        channelMessages.trust !== undefined &&
+        !["trusted", "untrusted"].includes(channelMessages.trust)
+      ) {
+        errors.push("channels.teamspeak.channelMessages.trust must be one of trusted, untrusted");
+      }
+    }
+  }
+  if (value.directMessages !== undefined) {
+    if (!isRecord(value.directMessages)) {
+      errors.push("channels.teamspeak.directMessages must be an object");
+    } else {
+      const directMessages = value.directMessages;
+      pushUnknownConfigKeyErrors(
+        errors,
+        directMessages,
+        TEAMSPEAK_DIRECT_MESSAGES_ALLOWED_KEYS,
+        "channels.teamspeak.directMessages"
+      );
+      if (directMessages.trust !== undefined && typeof directMessages.trust !== "string") {
+        errors.push("channels.teamspeak.directMessages.trust must be a string");
+      } else if (
+        directMessages.trust !== undefined &&
+        !["trusted", "untrusted"].includes(directMessages.trust)
+      ) {
+        errors.push("channels.teamspeak.directMessages.trust must be one of trusted, untrusted");
+      }
+    }
+  }
   if (value.voice !== undefined) {
     if (!isRecord(value.voice)) {
       errors.push("channels.teamspeak.voice must be an object");
@@ -3947,6 +4095,26 @@ const teamspeakConfigSchema = {
           allowedUsers: {
             type: "array",
             items: { type: "string" }
+          }
+        }
+      },
+      channelMessages: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          trust: {
+            type: "string",
+            enum: ["trusted", "untrusted"]
+          }
+        }
+      },
+      directMessages: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          trust: {
+            type: "string",
+            enum: ["trusted", "untrusted"]
           }
         }
       },
@@ -4080,6 +4248,10 @@ export const __testInternals = {
   normalizeTeamspeakVoiceConfig,
   normalizeTeamspeakSessionDefaults,
   normalizeTeamspeakCommandAuthorizationConfig,
+  normalizeTeamspeakMessageTrust,
+  normalizeTeamspeakChannelMessageTrust,
+  normalizeTeamspeakChannelMessagesConfig,
+  normalizeTeamspeakDirectMessagesConfig,
   normalizeIngressPath,
   resolveTeamspeakCliPath,
   resolveTeamspeakChannelConfig,
@@ -4146,6 +4318,14 @@ export const __testInternals = {
   isNicknameOnlySelfMessageMatch,
   isTeamspeakCommandAuthorized,
   resolveTeamspeakCommandAuthorized,
+  isTeamspeakChannelTextMessage,
+  isTeamspeakDirectTextMessage,
+  isTeamspeakChannelMessageTrusted,
+  isTeamspeakDirectMessageTrusted,
+  isTeamspeakMessageTrusted,
+  resolveTeamspeakTurnCommandAuthorized,
+  buildTeamspeakUntrustedMessageContext,
+  buildTeamspeakUntrustedChannelMessageContext,
   buildTeamspeakVoiceReplySystemPrompt,
   buildTeamspeakEventSystemPrompt,
   buildVoiceNormalizedEvent,

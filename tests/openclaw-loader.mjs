@@ -54,6 +54,21 @@ export function createPluginRuntimeStore(options = {}) {
 `
   ],
   [
+    "openclaw/plugin-sdk/security-runtime",
+    `
+export function wrapExternalContent(content, options = {}) {
+  const source = options.source || "unknown";
+  return [
+    "<<<external_untrusted_content:test>>>",
+    \`Source: \${source}\`,
+    "---",
+    content,
+    "<<<end_external_untrusted_content:test>>>"
+  ].join("\\n");
+}
+`
+  ],
+  [
     "openclaw/plugin-sdk/webhook-ingress",
     `
 export async function readJsonWebhookBodyOrReject() {
